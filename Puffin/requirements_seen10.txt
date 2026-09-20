@@ -1,0 +1,21 @@
+# Seen-10 runtime dependencies. Install torch/torchvision separately from the
+# CUDA 12.8 PyTorch index. flash-attn is omitted because this config uses
+# SDPA. DeepSpeed is not used as a runner, but XTuner 0.1.23 imports it at
+# module load time; install it with DS_BUILD_OPS=0 to avoid optional CUDA ops.
+accelerate==1.6.0
+deepspeed==0.16.7
+diffusers==0.34.0
+einops==0.8.1
+huggingface-hub[cli]==0.31.1
+mmengine==0.10.7
+numpy==2.2.5
+peft==0.15.2
+pillow==11.2.1
+PyYAML==6.0.2
+safetensors==0.5.3
+six==1.17.0
+timm==0.9.12
+tokenizers==0.21.2
+tqdm==4.67.1
+transformers==4.49.0
+xtuner==0.1.23

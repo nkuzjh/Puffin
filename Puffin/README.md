@@ -173,6 +173,8 @@ The scripts of the construction pipeline for our Puffin-4M will be updated in [D
 ## ✈️ Training
 We conduct a multi-stage training strategy, where the vision encoder, LLM, and the diffusion model are aligned in the first stage. Then, in the SFT stage, the models are jointly optimized using both base and thinking datasets. Finally, an instruction-tuning stage is applied, involving various cross-view generation and understanding tasks. The implementation details are provided in [Training](documents/TRAINING.md).
 
+For the manifest-driven CSGO Benchmark v2 Seen-10 generation adapter, training and evaluation commands are documented in [CSGO_SEEN10.md](CSGO_SEEN10.md).
+
 ## 🖼️ Evaluation
 We evaluate our camera-centric generation and understanding performance on public datasets and our constructed benchmark (🤗 [KangLiao/Puffin-4M/benchmark](https://huggingface.co/datasets/KangLiao/Puffin-4M/tree/main/benchmark)). 
 

@@ -22,6 +22,21 @@ from src.models.connector import ConnectorConfig, ConnectorEncoder
 from src.models.stable_diffusion3.pipeline_stable_diffusion_3_dynamic import StableDiffusion3Pipeline
 from src.datasets.utils import encode_fn, QUERY_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, INPUT_IMAGE_TOKEN_INDEX
 
+
+def _normalise_checkpoint_state(state_dict, *, label, prefixes=('module.',)):
+    """Unwrap common checkpoint containers and strip uniform key prefixes."""
+    while isinstance(state_dict, dict) and isinstance(state_dict.get('state_dict'), dict):
+        state_dict = state_dict['state_dict']
+    if not isinstance(state_dict, dict):
+        raise TypeError(f'{label} must contain a state-dict mapping, got {type(state_dict).__name__}')
+
+    state_dict = dict(state_dict)
+    for prefix in prefixes:
+        if state_dict and all(isinstance(key, str) and key.startswith(prefix) for key in state_dict):
+            state_dict = {key[len(prefix):]: value for key, value in state_dict.items()}
+    return state_dict
+
+
 class _ScaleGradient(Function):
     @staticmethod
     def forward(ctx, input, scale):
@@ -74,7 +89,12 @@ class Qwen2p5RadioStableDiffusion3HFDynamic(BaseModel):
                  fold_size=2,
                  unconditional=0.1,
                  unconditional_cross_view=0.1,
+                 pose_conditioning=False,
                  pretrained_pth=None,
+                 pretrained_vae_pth=None,
+                 strict_pretrained_loading=False,
+                 generation_dtype=None,
+                 val_autocast_dtype=None,
                  use_activation_checkpointing=False,
                  *args, **kwargs):
         super().__init__()
@@ -85,6 +105,17 @@ class Qwen2p5RadioStableDiffusion3HFDynamic(BaseModel):
         self.prompt_template = prompt_template
         self.unconditional = unconditional
         self.unconditional_cross_view = unconditional_cross_view
+        self.pose_conditioning = bool(pose_conditioning)
+        if isinstance(val_autocast_dtype, str):
+            dtype_name = val_autocast_dtype
+            val_autocast_dtype = getattr(torch, dtype_name, None)
+            if val_autocast_dtype is None:
+                raise ValueError(f'Unsupported val_autocast_dtype: {dtype_name!r}')
+        if val_autocast_dtype not in (None, torch.float16, torch.bfloat16):
+            raise ValueError(
+                'val_autocast_dtype must be torch.float16, torch.bfloat16, or None'
+            )
+        self.val_autocast_dtype = val_autocast_dtype
         
         # networks building
         # understanding branch
@@ -100,6 +131,13 @@ class Qwen2p5RadioStableDiffusion3HFDynamic(BaseModel):
         self.vae = BUILDER.build(vae)
         self.vae.requires_grad_(False)
         self.transformer = BUILDER.build(transformer)
+        if generation_dtype is not None:
+            if isinstance(generation_dtype, str):
+                generation_dtype = getattr(torch, generation_dtype, None)
+            if not isinstance(generation_dtype, torch.dtype):
+                raise ValueError(f'Unsupported generation_dtype: {generation_dtype!r}')
+            self.vae.to(dtype=generation_dtype)
+            self.transformer.to(dtype=generation_dtype)
         self.num_queries = num_queries
         self.connector_1 = ConnectorEncoder(ConnectorConfig(**connector_1))
         self.connector_2 = ConnectorEncoder(ConnectorConfig(**connector_2))
@@ -116,6 +154,18 @@ class Qwen2p5RadioStableDiffusion3HFDynamic(BaseModel):
         self.meta_queries = nn.Parameter(
             torch.zeros(num_queries, self.llm.config.hidden_size))
         nn.init.normal_(self.meta_queries, std=1 / math.sqrt(self.llm.config.hidden_size))
+        self.pose_mlp = None
+        if self.pose_conditioning:
+            hidden_size = self.llm.config.hidden_size
+            self.pose_mlp = nn.Sequential(
+                nn.Linear(5, hidden_size),
+                nn.SiLU(),
+                nn.Linear(hidden_size, hidden_size),
+            )
+            # Preserve the original Puffin query at initialization; the last
+            # layer learns a pose offset without disrupting the pretrained base.
+            nn.init.zeros_(self.pose_mlp[-1].weight)
+            nn.init.zeros_(self.pose_mlp[-1].bias)
         
         # networks and training initialization
         if freeze_visual_encoder:
@@ -133,14 +183,38 @@ class Qwen2p5RadioStableDiffusion3HFDynamic(BaseModel):
         self.test_scheduler = BUILDER.build(test_scheduler)
 
         self.use_activation_checkpointing = use_activation_checkpointing
+        self._activation_checkpointing_enabled = False
         if use_activation_checkpointing:
             self.llm.enable_input_require_grads()
             self.gradient_checkpointing_enable()
 
         if pretrained_pth is not None:
-            pretrained_state_dict = guess_load_checkpoint(pretrained_pth)
+            pretrained_state_dict = _normalise_checkpoint_state(
+                guess_load_checkpoint(pretrained_pth), label='Puffin base checkpoint'
+            )
             info = self.load_state_dict(pretrained_state_dict, strict=False)
+            if strict_pretrained_loading:
+                allowed_missing_prefixes = ('vae.', 'pose_mlp.')
+                invalid_missing = [
+                    key for key in info.missing_keys
+                    if not key.startswith(allowed_missing_prefixes)
+                ]
+                if invalid_missing or info.unexpected_keys:
+                    raise RuntimeError(
+                        'Puffin base checkpoint does not match the Seen-10 architecture; '
+                        f'invalid missing keys={invalid_missing[:20]}, '
+                        f'unexpected keys={info.unexpected_keys[:20]}'
+                    )
             print_log(f'Load pretrained weight from {pretrained_pth}')
+
+        if pretrained_vae_pth is not None:
+            vae_state_dict = _normalise_checkpoint_state(
+                guess_load_checkpoint(pretrained_vae_pth),
+                label='Puffin VAE checkpoint',
+                prefixes=('module.', 'vae.'),
+            )
+            self.vae.load_state_dict(vae_state_dict, strict=True)
+            print_log(f'Load pretrained VAE weight from {pretrained_vae_pth}')
             
     @property
     def device(self):
@@ -154,25 +228,64 @@ class Qwen2p5RadioStableDiffusion3HFDynamic(BaseModel):
         self.activation_checkpointing_enable()
 
     def activation_checkpointing_enable(self):
+        if self._activation_checkpointing_enabled:
+            return
         self.llm.gradient_checkpointing_enable()
         self.transformer.enable_gradient_checkpointing()
         self.connector_1.gradient_checkpointing = True
         self.connector_2.gradient_checkpointing = True
+        self._activation_checkpointing_enabled = True
         
     def gradient_checkpointing_disable(self):
         self.activation_checkpointing_disable()
 
     def activation_checkpointing_disable(self):
+        if not self._activation_checkpointing_enabled:
+            return
         self.llm.gradient_checkpointing_disable()
         self.transformer.disable_gradient_checkpointing()
         self.connector_1.gradient_checkpointing = False
         self.connector_2.gradient_checkpointing = False
+        self._activation_checkpointing_enabled = False
         
     def forward(self, data, data_samples=None, mode='loss'):
         if mode == 'loss':
             return self.compute_loss(data_dict=data)
+        if mode == 'predict':
+            if self.val_autocast_dtype is not None and self.device.type == 'cuda':
+                with torch.autocast(
+                    device_type='cuda', dtype=self.val_autocast_dtype
+                ):
+                    losses = self.compute_loss(data_dict=data)
+            else:
+                losses = self.compute_loss(data_dict=data)
+            from mmengine.structures import BaseDataElement
+
+            batch_size = len(data['cam2image']['texts'])
+            return [BaseDataElement() for _ in range(batch_size)] + [
+                BaseDataElement(loss=losses)
+            ]
         else:
             raise NotImplementedError
+
+    def _generation_queries(self, batch_size, pose_values=None):
+        queries = self.meta_queries[None].expand(batch_size, self.num_queries, -1)
+        if pose_values is None:
+            if self.pose_conditioning:
+                raise ValueError('pose_values are required when pose_conditioning is enabled')
+            return queries
+        if self.pose_mlp is None:
+            raise ValueError('pose_values were provided to a model without pose_conditioning')
+
+        pose_values = torch.as_tensor(pose_values, device=self.device, dtype=torch.float32)
+        if pose_values.ndim == 1:
+            pose_values = pose_values.unsqueeze(0)
+        if tuple(pose_values.shape) != (batch_size, 5):
+            raise ValueError(
+                f'pose_values must have shape ({batch_size}, 5), got {tuple(pose_values.shape)}'
+            )
+        pose_embed = self.pose_mlp(pose_values.to(dtype=self.pose_mlp[0].weight.dtype))
+        return queries + pose_embed[:, None, :].to(dtype=queries.dtype)
 
     def extract_visual_features(self, pixel_values):
         pixel_values = (pixel_values + 1.0) / 2     # [0, 1]
@@ -266,7 +379,9 @@ class Qwen2p5RadioStableDiffusion3HFDynamic(BaseModel):
     def train(self, mode=True):
         super().train(mode=mode)
         self.vae.train(mode=False)
-        if not mode:
+        if mode and self.use_activation_checkpointing:
+            self.gradient_checkpointing_enable()
+        elif not mode and self.use_activation_checkpointing:
             self.gradient_checkpointing_disable()
 
         return self
@@ -292,7 +407,14 @@ class Qwen2p5RadioStableDiffusion3HFDynamic(BaseModel):
                               append_queries=True):
         b, l, _ = query_embeds.shape
         assert l > 0
-        attention_mask = attention_mask.to(device=self.device, dtype=torch.bool)
+        token_embeddings = self.llm.get_input_embeddings()
+        embedding_weight = token_embeddings.weight
+        embedding_device = embedding_weight.device
+        embedding_dtype = embedding_weight.dtype
+        query_embeds = query_embeds.to(device=embedding_device, dtype=embedding_dtype)
+        attention_mask = attention_mask.to(device=embedding_device, dtype=torch.bool)
+        if input_ids is not None:
+            input_ids = input_ids.to(device=embedding_device)
         assert l == self.num_queries
 
         if append_queries:
@@ -309,8 +431,9 @@ class Qwen2p5RadioStableDiffusion3HFDynamic(BaseModel):
             position_ids = position_ids[..., -l:]
         else:
             inputs_embeds = torch.zeros(*input_ids.shape, self.llm.config.hidden_size,
-                                        device=self.device, dtype=self.dtype)
+                                        device=embedding_device, dtype=embedding_dtype)
             if image_embeds is not None:
+                image_embeds = image_embeds.to(device=embedding_device, dtype=embedding_dtype)
                 inputs_embeds[input_ids == self.image_token_id] = \
                     image_embeds.contiguous().view(-1, self.llm.config.hidden_size)
 
@@ -319,7 +442,7 @@ class Qwen2p5RadioStableDiffusion3HFDynamic(BaseModel):
 
             text_places = torch.logical_and(input_ids != self.image_token_id, input_ids != QUERY_TOKEN_INDEX)
 
-            inputs_embeds[text_places] = self.llm.get_input_embeddings()(input_ids[text_places])
+            inputs_embeds[text_places] = token_embeddings(input_ids[text_places])
 
         inputs = dict(inputs_embeds=inputs_embeds,
                       attention_mask=attention_mask,
@@ -426,7 +549,7 @@ class Qwen2p5RadioStableDiffusion3HFDynamic(BaseModel):
                 for text in data_dict['texts']]
 
         text_inputs = self.prepare_gen_prompts(texts)
-        hidden_states = self.meta_queries[None].expand(b, self.num_queries, -1)
+        hidden_states = self._generation_queries(b, data_dict.get('pose_values'))
 
         inputs = self.prepare_forward_input(query_embeds=hidden_states, **text_inputs)
 
@@ -599,6 +722,7 @@ class Qwen2p5RadioStableDiffusion3HFDynamic(BaseModel):
                  prompt,
                  cfg_prompt,
                  cam_values=None,
+                 pose_values=None,
                  pixel_values_init=None,
                  cfg_scale=4.5,
                  num_steps=50,
@@ -691,7 +815,17 @@ class Qwen2p5RadioStableDiffusion3HFDynamic(BaseModel):
             text_inputs = self.prepare_gen_prompts(prompt + cfg_prompt)
             cond_latents = None
 
-        hidden_states = self.meta_queries[None].expand(2*b, self.num_queries, -1)
+        if pose_values is None:
+            query_pose_values = None
+        else:
+            query_pose_values = torch.as_tensor(pose_values)
+            if query_pose_values.ndim == 1:
+                query_pose_values = query_pose_values.unsqueeze(0)
+            if query_pose_values.shape[0] != b:
+                raise ValueError(f'Expected one pose row per prompt ({b}), got {query_pose_values.shape[0]}')
+            # Keep pose/radar conditioning on both the conditional and CFG branches.
+            query_pose_values = torch.cat([query_pose_values, query_pose_values], dim=0)
+        hidden_states = self._generation_queries(2*b, query_pose_values)
         inputs = self.prepare_forward_input(query_embeds=hidden_states, **text_inputs)
 
         output = self.llm.model(**inputs, return_dict=True)

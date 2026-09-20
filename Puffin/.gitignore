@@ -126,5 +126,6 @@ batchscript-*
 .idea/
 checkpoints/
 output/
+/outputs/
 results/
 hf_demo/
