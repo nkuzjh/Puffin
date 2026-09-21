@@ -393,10 +393,48 @@ class Qwen2p5RadioStableDiffusion3HFDynamic(BaseModel):
         return z
 
     @torch.no_grad()
-    def latents_to_pixels(self, z):
+    def encode_radar_posterior(self, image):
+        """Encode one radar image once so its posterior parameters can be cached."""
+        if image.ndim == 3:
+            image = image.unsqueeze(0)
+        if image.ndim != 4 or image.shape[0] != 1:
+            raise ValueError("encode_radar_posterior expects one image with shape (1, C, H, W)")
+        image = image.to(device=self.device, dtype=self.dtype)
+        posterior = self.vae.encode(image).latent_dist
+        return posterior.mean, posterior.std
+
+    @torch.no_grad()
+    def latents_to_pixels(self, z, chunk_size=None):
         z = (z / self.vae.config.scaling_factor) + self.vae.config.shift_factor
-        x_rec = self.vae.decode(z).sample
+        if chunk_size is None or chunk_size >= len(z):
+            x_rec = self.vae.decode(z).sample
+        else:
+            if chunk_size <= 0:
+                raise ValueError("chunk_size must be positive")
+            x_rec = torch.cat(
+                [self.vae.decode(z[start : start + chunk_size]).sample for start in range(0, len(z), chunk_size)],
+                dim=0,
+            )
         return x_rec
+
+    def _get_generation_pipeline(self):
+        pipeline = self.__dict__.get("_seen10_generation_pipeline")
+        if pipeline is None:
+            pipeline = StableDiffusion3Pipeline(
+                transformer=self.transformer,
+                scheduler=self.test_scheduler,
+                vae=self.vae,
+                text_encoder=None,
+                tokenizer=None,
+                text_encoder_2=None,
+                tokenizer_2=None,
+                text_encoder_3=None,
+                tokenizer_3=None,
+            )
+            # The pipeline shares the model's modules; keeping it out of
+            # nn.Module's child registry avoids duplicate checkpoint keys.
+            object.__setattr__(self, "_seen10_generation_pipeline", pipeline)
+        return pipeline
 
     def prepare_forward_input(self,
                               query_embeds,
@@ -732,7 +770,9 @@ class Qwen2p5RadioStableDiffusion3HFDynamic(BaseModel):
                  max_new_tokens=512,
                  reasoning=False,
                  prompt_reasoning=None,
-                 progress_bar=True):
+                 progress_bar=True,
+                 radar_latents=None,
+                 decoder_chunk_size=None):
         assert len(prompt) == len(cfg_prompt)
         b = len(prompt)
         output_reasoning = [''] * b
@@ -787,10 +827,25 @@ class Qwen2p5RadioStableDiffusion3HFDynamic(BaseModel):
         
         if cam_values is not None:
             # for the generation with the camera map
-            cam_values = [[img.to(dtype=self.dtype, device=self.device) for img in ref_images]
+            if radar_latents is None:
+                cam_values = [[img.to(dtype=self.dtype, device=self.device) for img in ref_images]
+                              for ref_images in cam_values]
+                cond_latents = [[self.pixels_to_latents(img[None])[0] for img in ref_images]
                                 for ref_images in cam_values]
-            cond_latents = [[self.pixels_to_latents(img[None])[0] for img in ref_images]
-                                for ref_images in cam_values]
+            else:
+                if pixel_values_init is not None:
+                    raise ValueError("radar_latents cannot be combined with pixel_values_init")
+                if isinstance(radar_latents, torch.Tensor):
+                    if radar_latents.ndim != 4 or radar_latents.shape[0] != b:
+                        raise ValueError(f"radar_latents must have shape (batch, C, H, W), got {tuple(radar_latents.shape)}")
+                    radar_latents = radar_latents.to(device=self.device)
+                else:
+                    if len(radar_latents) != b:
+                        raise ValueError(f"Expected one radar latent per prompt ({b}), got {len(radar_latents)}")
+                    radar_latents = torch.stack(
+                        [latent.to(device=self.device) for latent in radar_latents], dim=0
+                    )
+                cond_latents = radar_latents[:, None]
             text_inputs = self.prepare_gen_prompts(prompt + cfg_prompt)
             if pixel_values_init is not None:
                 # for the generation with the camera map and initial view (cross-view generation)
@@ -809,7 +864,11 @@ class Qwen2p5RadioStableDiffusion3HFDynamic(BaseModel):
                                 for ref_imgs in pixel_values_init]
                 cond_latents = [cam + img for cam, img in zip(cond_latents, cond_latents_init)]
             
-            cond_latents = cond_latents * 2
+            if cfg_scale > 1:
+                if isinstance(cond_latents, torch.Tensor):
+                    cond_latents = torch.cat([cond_latents, cond_latents], dim=0)
+                else:
+                    cond_latents = cond_latents * 2
         else:
             # for the text2image generation
             text_inputs = self.prepare_gen_prompts(prompt + cfg_prompt)
@@ -832,17 +891,7 @@ class Qwen2p5RadioStableDiffusion3HFDynamic(BaseModel):
         hidden_states = output.last_hidden_state[:, -self.num_queries:]
         pooled_prompt_embeds, prompt_embeds = self.llm2dit(hidden_states)
 
-        pipeline = StableDiffusion3Pipeline(
-            transformer=self.transformer,
-            scheduler=self.test_scheduler,
-            vae=self.vae,
-            text_encoder=None,
-            tokenizer=None,
-            text_encoder_2=None,
-            tokenizer_2=None,
-            text_encoder_3=None,
-            tokenizer_3=None,
-        )
+        pipeline = self._get_generation_pipeline()
 
         pipeline.set_progress_bar_config(disable=not progress_bar)
 
@@ -860,7 +909,7 @@ class Qwen2p5RadioStableDiffusion3HFDynamic(BaseModel):
             cond_latents=cond_latents
         ).images.to(self.dtype)
 
-        return self.latents_to_pixels(samples), output_reasoning
+        return self.latents_to_pixels(samples, chunk_size=decoder_chunk_size), output_reasoning
     
     @torch.no_grad()
     def understand(self, prompt, pixel_values, max_new_tokens=512, progress_bar=True):

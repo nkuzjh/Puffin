@@ -23,9 +23,13 @@ from csgo_seen10.inference_utils import (
     atomic_write_json,
     is_valid_rgb_jpeg,
     load_matching_manifest,
+    pad_inference_batch,
     run_signature,
+    sample_diagonal_gaussian,
+    sample_seed,
     write_rgb_jpeg,
 )
+from src.models.stable_diffusion3.transformer_sd3_dynamic import SD3Transformer2DModel
 from src.models.puffin.model import Qwen2p5RadioStableDiffusion3HFDynamic
 
 
@@ -198,6 +202,177 @@ class Seen10InferenceArtifactTests(unittest.TestCase):
                 run_signature({"checkpoint_sha256": "base-b", "seed": 7}),
             )
 
+    def test_per_sample_rng_states_are_separate_and_order_invariant(self):
+        def generate(order):
+            values = {}
+            for sample_id in order:
+                item_seed = sample_seed(17, sample_id)
+                posterior_generator = torch.Generator().manual_seed(item_seed)
+                diffusion_generator = torch.Generator().manual_seed(item_seed)
+                posterior = sample_diagonal_gaussian(
+                    torch.zeros(8), torch.ones(8), posterior_generator
+                )
+                torch.randn(37, generator=posterior_generator)
+                diffusion = torch.randn(8, generator=diffusion_generator)
+                values[sample_id] = (posterior, diffusion)
+            return values
+
+        forward = generate(["map_a/frame_1", "map_b/frame_2"])
+        reverse = generate(["map_b/frame_2", "map_a/frame_1"])
+        for sample_id in forward:
+            torch.testing.assert_close(forward[sample_id][0], reverse[sample_id][0])
+            torch.testing.assert_close(forward[sample_id][1], reverse[sample_id][1])
+            # Matching legacy starting seeds are safe because each stochastic
+            # stage owns its own Generator object and state.
+            torch.testing.assert_close(forward[sample_id][0], forward[sample_id][1])
+
+    def test_compiled_tail_batch_padding_preserves_target_free_contract(self):
+        samples = [
+            {
+                "cam_values": torch.full((3, 4, 4), float(index)),
+                "pose_values": torch.full((5,), float(index)),
+                "text": f"sample {index}",
+                "metadata": {"sample_id": f"id-{index}", "map_name": "map", "file_frame": str(index)},
+            }
+            for index in range(2)
+        ]
+        batch = collate_seen10(samples)
+        padded = pad_inference_batch(batch, 4)["data"]["cam2image"]
+
+        self.assertEqual(len(padded["texts"]), 4)
+        self.assertEqual(tuple(padded["pose_values"].shape), (4, 5))
+        self.assertEqual([row["sample_id"] for row in padded["metadata"]], ["id-0", "id-1", "id-1", "id-1"])
+        self.assertNotIn("pixel_values", padded)
+        self.assertEqual(float(padded["cam_values"][3][0][0, 0, 0]), 1.0)
+
+    def test_compile_engine_opts_in_once_with_static_fullgraph_settings(self):
+        import infer_seen10
+
+        model = SimpleNamespace(transformer=object())
+        original_transformer = model.transformer
+        with patch("infer_seen10.torch.compile", return_value="compiled-transformer") as compile_mock:
+            infer_seen10._configure_transformer_inference(model, "compiled")
+
+        compile_mock.assert_called_once_with(
+            original_transformer,
+            mode="reduce-overhead",
+            dynamic=False,
+            fullgraph=True,
+        )
+        self.assertEqual(model.transformer, "compiled-transformer")
+        compile_mock.reset_mock()
+        infer_seen10._configure_transformer_inference(model, "eager")
+        compile_mock.assert_not_called()
+
+    def test_batched_resume_recomputes_incomplete_block_and_writes_only_missing(self):
+        from torch.utils.data import Dataset
+        import infer_seen10
+
+        rows = [
+            {
+                "sample_id": f"map_a/frame_{index}",
+                "map_name": "map_a",
+                "file_frame": f"frame_{index}",
+                "image_path": f"unused-target-{index}.jpg",
+                "radar_path": "unused-radar.png",
+                "pose": [0.1] * 5,
+            }
+            for index in range(3)
+        ]
+
+        class _FakeDataset(Dataset):
+            def __init__(self, **kwargs):
+                self.rows = rows
+                self.benchmark = SimpleNamespace(maps=["map_a"])
+
+            def __len__(self):
+                return len(self.rows)
+
+            def __getitem__(self, index):
+                row = self.rows[index]
+                return {
+                    "cam_values": torch.zeros(3, 8, 8),
+                    "pose_values": torch.tensor(row["pose"], dtype=torch.float32),
+                    "text": f"prompt {index}",
+                    "metadata": {
+                        "sample_id": row["sample_id"],
+                        "map_name": row["map_name"],
+                        "file_frame": row["file_frame"],
+                    },
+                }
+
+        class _FakeModel:
+            device = torch.device("cpu")
+            dtype = torch.float32
+            vae = SimpleNamespace(config=SimpleNamespace(shift_factor=0.0, scaling_factor=1.0))
+
+            def __init__(self):
+                self._csgo_checkpoint = "fake-checkpoint.pth"
+                self.generate_calls = []
+                self.posterior_encodes = 0
+
+            def encode_radar_posterior(self, radar):
+                self.posterior_encodes += 1
+                return torch.zeros(1, 1, 2, 2), torch.zeros(1, 1, 2, 2)
+
+            def generate(self, prompt, radar_latents, **kwargs):
+                self.generate_calls.append(tuple(prompt))
+                count = len(prompt)
+                value = 0.15 * len(self.generate_calls)
+                return torch.full((count, 3, 448, 448), value), None
+
+        model = _FakeModel()
+        posterior_cache = {}
+        output_root = self.root / "batched"
+        original_path = output_root / "discrete" / "gen_imgs" / "map_a" / "frame_0.jpg"
+        missing_path = output_root / "discrete" / "gen_imgs" / "map_a" / "frame_1.jpg"
+        with patch.object(infer_seen10, "CsgoSeen10Dataset", _FakeDataset):
+            infer_seen10._generate_split(
+                model,
+                data_root="unused",
+                shared_eval_dir="unused",
+                split="seen_discrete_test",
+                task_name="discrete",
+                output_root=output_root,
+                seed=4,
+                steps=1,
+                cfg_scale=4.5,
+                maps=None,
+                max_samples=None,
+                checkpoint_sha256="a" * 64,
+                inference_engine="eager",
+                batch_size=2,
+                decoder_chunk_size=1,
+                radar_posterior_cache=posterior_cache,
+            )
+            original_bytes = original_path.read_bytes()
+            missing_path.unlink()
+            first_run_call_count = len(model.generate_calls)
+            resumed = infer_seen10._generate_split(
+                model,
+                data_root="unused",
+                shared_eval_dir="unused",
+                split="seen_discrete_test",
+                task_name="discrete",
+                output_root=output_root,
+                seed=4,
+                steps=1,
+                cfg_scale=4.5,
+                maps=None,
+                max_samples=None,
+                checkpoint_sha256="a" * 64,
+                inference_engine="eager",
+                batch_size=2,
+                decoder_chunk_size=1,
+                radar_posterior_cache=posterior_cache,
+            )
+
+        self.assertEqual(resumed["generated"], 1)
+        self.assertEqual(len(model.generate_calls), first_run_call_count + 1)
+        self.assertEqual(model.posterior_encodes, 1)
+        self.assertEqual(original_path.read_bytes(), original_bytes)
+        self.assertTrue(is_valid_rgb_jpeg(missing_path))
+
     def test_pose_mlp_learns_through_frozen_language_path(self):
         pose_mlp = torch.nn.Sequential(
             torch.nn.Linear(5, 8), torch.nn.SiLU(), torch.nn.Linear(8, 8)
@@ -330,6 +505,84 @@ class PuffinForwardInputTests(unittest.TestCase):
         )
         self.assertEqual(cached_inputs["inputs_embeds"].device, device)
         self.assertEqual(cached_inputs["inputs_embeds"].dtype, torch.bfloat16)
+
+
+class Seen10TransformerFastPathTests(unittest.TestCase):
+    def _transformer(self):
+        torch.manual_seed(29)
+        return SD3Transformer2DModel(
+            sample_size=8,
+            patch_size=2,
+            in_channels=2,
+            num_layers=1,
+            attention_head_dim=4,
+            num_attention_heads=2,
+            joint_attention_dim=6,
+            caption_projection_dim=8,
+            pooled_projection_dim=4,
+            out_channels=2,
+            pos_embed_max_size=16,
+        ).eval()
+
+    def test_dense_single_radar_matches_nested_dynamic_path(self):
+        model = self._transformer()
+        batch_size = 2
+        hidden = torch.randn(batch_size, 2, 8, 8)
+        cond = torch.randn(batch_size, 1, 2, 8, 8)
+        encoder = torch.randn(batch_size, 3, 6)
+        pooled = torch.randn(batch_size, 4)
+        timestep = torch.tensor([2.0, 7.0])
+
+        with torch.inference_mode():
+            dense = model(
+                hidden_states=hidden,
+                cond_hidden_states=cond,
+                timestep=timestep,
+                encoder_hidden_states=encoder,
+                pooled_projections=pooled,
+                return_dict=False,
+            )[0]
+            dynamic = model(
+                hidden_states=hidden,
+                cond_hidden_states=[[cond[index, 0]] for index in range(batch_size)],
+                timestep=timestep,
+                encoder_hidden_states=encoder,
+                pooled_projections=pooled,
+                return_dict=False,
+            )[0]
+
+        torch.testing.assert_close(dense, dynamic, atol=1e-5, rtol=1e-5)
+
+    def test_multi_reference_and_variable_size_inputs_keep_dynamic_path(self):
+        model = self._transformer()
+        encoder = torch.randn(2, 3, 6)
+        pooled = torch.randn(2, 4)
+        timestep = torch.tensor([2.0, 7.0])
+        hidden = [torch.randn(2, 8, 8), torch.randn(2, 6, 8)]
+        refs = [[torch.randn(2, 8, 8)], [torch.randn(2, 6, 8)]]
+
+        with torch.inference_mode():
+            variable, = model(
+                hidden_states=hidden,
+                cond_hidden_states=refs,
+                timestep=timestep,
+                encoder_hidden_states=encoder,
+                pooled_projections=pooled,
+                return_dict=False,
+            )
+            multi_ref, = model(
+                hidden_states=torch.randn(2, 2, 8, 8),
+                cond_hidden_states=torch.randn(2, 2, 2, 8, 8),
+                timestep=timestep,
+                encoder_hidden_states=encoder,
+                pooled_projections=pooled,
+                return_dict=False,
+            )
+
+        self.assertIsInstance(variable, list)
+        self.assertEqual([tuple(output.shape) for output in variable], [(2, 8, 8), (2, 6, 8)])
+        self.assertIsInstance(multi_ref, torch.Tensor)
+        self.assertEqual(tuple(multi_ref.shape), (2, 2, 8, 8))
 
 
 if __name__ == "__main__":

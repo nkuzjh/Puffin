@@ -1161,7 +1161,10 @@ class StableDiffusion3Pipeline(DiffusionPipeline, SD3LoraLoaderMixin, FromSingle
 
         if cond_latents is not None and self.do_classifier_free_guidance:
             if len(cond_latents) == latents.shape[0]:
-                cond_latents = cond_latents * 2
+                if isinstance(cond_latents, torch.Tensor):
+                    cond_latents = torch.cat([cond_latents, cond_latents], dim=0)
+                else:
+                    cond_latents = cond_latents * 2
 
         # 7. Denoising loop
         with self.progress_bar(total=num_inference_steps) as progress_bar:

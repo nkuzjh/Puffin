@@ -7,7 +7,7 @@ cd "$PROJECT_ROOT"
 
 MODE="${1:-}"
 if [[ -z "$MODE" ]]; then
-  echo "Usage: $0 {check|smoke|train|infer|eval|all} [--seed N] [options]" >&2
+  echo "Usage: $0 {check|smoke|train|infer|eval|all} [--seed N] [--inference-engine eager|compiled] [--batch-size N] [options]" >&2
   exit 2
 fi
 shift
@@ -74,6 +74,10 @@ while (($#)); do
       if [[ "$1" == "--steps" ]]; then
         HAS_STEPS=1
       fi
+      INFER_ARGS+=("$1" "$2")
+      shift 2
+      ;;
+    --inference-engine|--batch-size|--decoder-chunk-size)
       INFER_ARGS+=("$1" "$2")
       shift 2
       ;;

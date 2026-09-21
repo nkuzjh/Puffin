@@ -22,8 +22,10 @@ from csgo_seen10.inference_utils import (
     is_valid_rgb_jpeg,
     load_matching_manifest,
     run_signature,
+    sample_diagonal_gaussian,
     sample_seed,
     sha256_file,
+    pad_inference_batch,
     write_rgb_jpeg,
 )
 
@@ -33,6 +35,12 @@ CONFIG = PROJECT_ROOT / "configs/pipelines/csgo_seen10.py"
 DEFAULT_OUTPUT_ROOT = Path(
     os.environ.get("OUTPUT_ROOT", PROJECT_ROOT / "outputs/csgo_benchmark_v2_seen10/Puffin")
 )
+_COMPILE_SETTINGS = {
+    "target": "model.transformer fixed dense 448px single-radar path",
+    "mode": "reduce-overhead",
+    "dynamic": False,
+    "fullgraph": True,
+}
 
 
 def _load_model(checkpoint: str, device: torch.device):
@@ -52,6 +60,18 @@ def _load_model(checkpoint: str, device: torch.device):
     return model
 
 
+def _configure_transformer_inference(model, inference_engine: str) -> None:
+    if inference_engine == "compiled":
+        model.transformer = torch.compile(
+            model.transformer,
+            mode=_COMPILE_SETTINGS["mode"],
+            dynamic=_COMPILE_SETTINGS["dynamic"],
+            fullgraph=_COMPILE_SETTINGS["fullgraph"],
+        )
+    elif inference_engine != "eager":
+        raise ValueError(f"Unsupported inference engine: {inference_engine!r}")
+
+
 def _generate_split(
     model,
     *,
@@ -66,6 +86,10 @@ def _generate_split(
     maps: list[str] | None,
     max_samples: int | None,
     checkpoint_sha256: str,
+    inference_engine: str = "eager",
+    batch_size: int = 1,
+    decoder_chunk_size: int | None = None,
+    radar_posterior_cache: dict | None = None,
 ) -> dict[str, int]:
     dataset = CsgoSeen10Dataset(
         data_root=data_root,
@@ -76,7 +100,9 @@ def _generate_split(
         maps=maps,
         max_samples=max_samples,
     )
-    dataloader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0, collate_fn=collate_seen10)
+    dataloader = DataLoader(
+        dataset, batch_size=batch_size, shuffle=False, num_workers=0, collate_fn=collate_seen10
+    )
     gen_root = output_root / task_name / "gen_imgs"
     task_root = output_root / task_name
     manifest_path = task_root / "inference_manifest.json"
@@ -91,7 +117,7 @@ def _generate_split(
         sample_id_digest.update(row["sample_id"].encode("utf-8"))
         sample_id_digest.update(b"\n")
 
-    signature_fields = {
+    legacy_signature_fields = {
         "task": task_name,
         "split": split,
         "seed": int(seed),
@@ -105,6 +131,19 @@ def _generate_split(
         "output_size": [448, 448],
         "output_format": "RGB JPEG",
     }
+    accelerated = inference_engine == "compiled" or batch_size > 1
+    seed_strategy = "per-sample separate posterior/diffusion generators, both seeded by sha256(seed:sample_id)"
+    signature_fields = dict(legacy_signature_fields)
+    if accelerated:
+        signature_fields.update(
+            inference_engine=inference_engine,
+            batch_size=int(batch_size),
+            inference_optimization_version=1,
+            seed_strategy=seed_strategy,
+            decoder_chunk_size=decoder_chunk_size,
+        )
+        if inference_engine == "compiled":
+            signature_fields["compile_settings"] = dict(_COMPILE_SETTINGS)
     signature = run_signature(signature_fields)
     existing_manifest = load_matching_manifest(manifest_path, signature)
     if existing_manifest is None and gen_root.exists():
@@ -129,6 +168,11 @@ def _generate_split(
             raise ValueError(f"Unexpected prediction image outside selected split: {extra_images[0]}")
 
     task_root.mkdir(parents=True, exist_ok=True)
+    initial_compile_status = "pending_first_inference"
+    if inference_engine == "compiled" and existing_manifest is not None:
+        initial_compile_status = existing_manifest.get(
+            "compile_status", initial_compile_status
+        )
     initial_manifest = {
         **signature_fields,
         "run_signature": signature,
@@ -137,52 +181,122 @@ def _generate_split(
         "deterministic_seed": "sha256(seed:sample_id) first 8 bytes little-endian",
         "complete": False,
     }
+    if accelerated and inference_engine == "compiled":
+        initial_manifest["compile_status"] = initial_compile_status
     atomic_write_json(initial_manifest, manifest_path)
 
     counts = {"generated": 0, "skipped_existing": 0}
     device = model.device
+    if radar_posterior_cache is None:
+        radar_posterior_cache = {}
+    compile_status = "not_requested"
+    if inference_engine == "compiled":
+        compile_status = initial_compile_status
     for batch in dataloader:
         sample = batch["data"]["cam2image"]
-        metadata = sample["metadata"][0]
-        sample_id = metadata["sample_id"]
-        map_name = metadata["map_name"]
-        file_frame = metadata["file_frame"]
-        output_path = gen_root / map_name / f"{file_frame}.jpg"
-        if output_path.exists():
-            if not is_valid_rgb_jpeg(output_path):
-                raise ValueError(f"Refusing to overwrite an invalid existing prediction: {output_path}")
-            counts["skipped_existing"] += 1
+        real_count = len(sample["metadata"])
+        if inference_engine == "compiled" and real_count < batch_size:
+            pad_inference_batch(batch, batch_size)
+            sample = batch["data"]["cam2image"]
+
+        metadata = sample["metadata"]
+        real_metadata = metadata[:real_count]
+        output_paths = [
+            gen_root / row["map_name"] / f"{row['file_frame']}.jpg" for row in real_metadata
+        ]
+        missing_indices = []
+        for index, output_path in enumerate(output_paths):
+            if output_path.exists():
+                if not is_valid_rgb_jpeg(output_path):
+                    raise ValueError(f"Refusing to overwrite an invalid existing prediction: {output_path}")
+                counts["skipped_existing"] += 1
+            else:
+                missing_indices.append(index)
+
+        # Manifest rows are stable contiguous blocks. If any output in one is
+        # absent, rerun the whole block so all batch inputs and RNG streams
+        # retain their original positions, then write only the absent images.
+        if not missing_indices:
             continue
 
-        radar = sample["cam_values"][0][0].to(device=device, dtype=model.dtype)
-        pose = sample["pose_values"].to(device=device, dtype=torch.float32)
-        prompt = sample["texts"]
-        item_seed = sample_seed(seed, sample_id)
-        cuda_devices = [device.index if device.index is not None else torch.cuda.current_device()] if device.type == "cuda" else []
-        with torch.random.fork_rng(devices=cuda_devices):
-            torch.manual_seed(item_seed)
-            if device.type == "cuda":
-                torch.cuda.manual_seed_all(item_seed)
-            generator = torch.Generator(device=device).manual_seed(item_seed)
+        prompts = sample["texts"]
+        poses = sample["pose_values"].to(device=device, dtype=torch.float32)
+        if not accelerated:
+            metadata_row = metadata[0]
+            radar = sample["cam_values"][0][0].to(device=device, dtype=model.dtype)
+            item_seed = sample_seed(seed, metadata_row["sample_id"])
+            cuda_devices = (
+                [device.index if device.index is not None else torch.cuda.current_device()]
+                if device.type == "cuda" else []
+            )
+            with torch.random.fork_rng(devices=cuda_devices):
+                torch.manual_seed(item_seed)
+                if device.type == "cuda":
+                    torch.cuda.manual_seed_all(item_seed)
+                generator = torch.Generator(device=device).manual_seed(item_seed)
+                with torch.inference_mode():
+                    generated, _ = model.generate(
+                        prompt=prompts,
+                        cfg_prompt=[""],
+                        cam_values=[[radar]],
+                        pose_values=poses,
+                        cfg_scale=cfg_scale,
+                        num_steps=steps,
+                        generator=generator,
+                        height=448,
+                        width=448,
+                        progress_bar=False,
+                        decoder_chunk_size=decoder_chunk_size,
+                    )
+        else:
+            radar_latents = []
+            diffusion_generators = []
+            for index, metadata_row in enumerate(metadata):
+                map_name = metadata_row["map_name"]
+                if map_name not in radar_posterior_cache:
+                    radar = sample["cam_values"][index][0]
+                    radar_posterior_cache[map_name] = model.encode_radar_posterior(radar)
+                posterior = radar_posterior_cache[map_name]
+                item_seed = sample_seed(seed, metadata_row["sample_id"])
+                posterior_generator = torch.Generator(device=device).manual_seed(item_seed)
+                posterior_sample = sample_diagonal_gaussian(*posterior, posterior_generator)
+                radar_latent = (
+                    (posterior_sample - model.vae.config.shift_factor)
+                    * model.vae.config.scaling_factor
+                )
+                radar_latents.append(radar_latent[0])
+                # A fresh generator with the same per-sample seed preserves the
+                # legacy diffusion stream while separating it from VAE sampling.
+                diffusion_generators.append(torch.Generator(device=device).manual_seed(item_seed))
+
             with torch.inference_mode():
                 generated, _ = model.generate(
-                    prompt=prompt,
-                    cfg_prompt=[""],
-                    cam_values=[[radar]],
-                    pose_values=pose,
+                    prompt=prompts,
+                    cfg_prompt=[""] * len(prompts),
+                    cam_values=sample["cam_values"],
+                    radar_latents=radar_latents,
+                    pose_values=poses,
                     cfg_scale=cfg_scale,
                     num_steps=steps,
-                    generator=generator,
+                    generator=diffusion_generators,
                     height=448,
                     width=448,
                     progress_bar=False,
+                    decoder_chunk_size=decoder_chunk_size,
                 )
-        if write_rgb_jpeg(generated[0], output_path):
-            counts["generated"] += 1
-            if counts["generated"] > 0 and counts["generated"] % 100 == 0:
-                print(f"{task_name}: generated={counts['generated']} skipped={counts['skipped_existing']}", flush=True)
-        else:
-            counts["skipped_existing"] += 1
+
+        if inference_engine == "compiled" and compile_status == "pending_first_inference":
+            compile_status = "first_inference_succeeded"
+            initial_manifest["compile_status"] = compile_status
+            atomic_write_json(initial_manifest, manifest_path)
+
+        for index in missing_indices:
+            if write_rgb_jpeg(generated[index], output_paths[index]):
+                counts["generated"] += 1
+                if counts["generated"] % 100 == 0:
+                    print(f"{task_name}: generated={counts['generated']} skipped={counts['skipped_existing']}", flush=True)
+            else:
+                counts["skipped_existing"] += 1
 
     manifest = {
         **signature_fields,
@@ -191,8 +305,10 @@ def _generate_split(
         "counts": counts,
         "target_read": False,
     }
+    if accelerated and inference_engine == "compiled":
+        manifest["compile_status"] = compile_status
     manifest["present_samples"] = sum(
-        (gen_root / row["map_name"] / f"{row['file_frame']}.jpg").is_file()
+        is_valid_rgb_jpeg(gen_root / row["map_name"] / f"{row['file_frame']}.jpg")
         for row in dataset.rows
     )
     manifest["complete"] = manifest["present_samples"] == len(dataset)
@@ -211,6 +327,15 @@ def main() -> int:
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
     parser.add_argument("--steps", type=int, default=28)
     parser.add_argument("--cfg-scale", type=float, default=4.5)
+    parser.add_argument(
+        "--inference-engine", choices=("eager", "compiled"), default="eager",
+        help="Compile only the fixed-size SD3 transformer path when set to compiled",
+    )
+    parser.add_argument("--batch-size", type=int, default=1, help="Stable contiguous manifest block size")
+    parser.add_argument(
+        "--decoder-chunk-size", type=int, default=None,
+        help="VAE decode chunk size; batched inference defaults to one image per decode chunk",
+    )
     parser.add_argument("--maps", nargs="*", default=None)
     parser.add_argument("--max-samples", type=int, default=None, help="Diagnostic prefix only; omit for full evaluation coverage")
     args = parser.parse_args()
@@ -222,6 +347,10 @@ def main() -> int:
         parser.error("--max-samples must be positive")
     if args.steps <= 0:
         parser.error("--steps must be positive")
+    if args.batch_size <= 0:
+        parser.error("--batch-size must be positive")
+    if args.decoder_chunk_size is not None and args.decoder_chunk_size <= 0:
+        parser.error("--decoder-chunk-size must be positive")
     if not math.isfinite(args.cfg_scale):
         parser.error("--cfg-scale must be finite")
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
@@ -238,6 +367,11 @@ def main() -> int:
     model = _load_model(str(checkpoint), device)
     model._csgo_checkpoint = str(checkpoint)
     checkpoint_sha256 = sha256_file(checkpoint)
+    _configure_transformer_inference(model, args.inference_engine)
+    decoder_chunk_size = args.decoder_chunk_size
+    if decoder_chunk_size is None and args.batch_size > 1:
+        decoder_chunk_size = 1
+    radar_posterior_cache = {}
 
     tasks = []
     if args.mode in ("discrete", "both"):
@@ -258,6 +392,10 @@ def main() -> int:
             maps=args.maps,
             max_samples=args.max_samples,
             checkpoint_sha256=checkpoint_sha256,
+            inference_engine=args.inference_engine,
+            batch_size=args.batch_size,
+            decoder_chunk_size=decoder_chunk_size,
+            radar_posterior_cache=radar_posterior_cache,
         )
     return 0
 

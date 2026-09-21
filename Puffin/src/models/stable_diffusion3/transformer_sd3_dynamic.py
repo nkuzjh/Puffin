@@ -554,25 +554,49 @@ class SD3Transformer2DModel(
                     "Passing `scale` via `joint_attention_kwargs` when not using the PEFT backend is ineffective."
                 )
 
-        latent_sizes = [hs.shape[-2:] for hs in hidden_states]
         bsz = len(hidden_states)
 
-        hidden_states_list = []
-        for idx in range(bsz):
-            hidden_states_per_sample = self.pos_embed(hidden_states[idx][None])[0]
-            if cond_hidden_states is not None:
-                for ref in cond_hidden_states[idx]:
-                    hidden_states_per_sample = torch.cat(
-                        [hidden_states_per_sample, self.pos_embed(ref[None])[0]])
+        # Seen-10 supplies a dense [batch, one_radar, channels, height, width]
+        # condition only when every 448px sample has the same latent geometry.
+        # That lets the transformer avoid per-sample PatchEmbed, concatenation,
+        # and padding while keeping the original list-based route for general
+        # variable-size and multi-reference inference.
+        dense_single_radar = (
+            isinstance(hidden_states, torch.Tensor)
+            and isinstance(cond_hidden_states, torch.Tensor)
+            and hidden_states.ndim == 4
+            and cond_hidden_states.ndim == 5
+            and cond_hidden_states.shape[0] == bsz
+            and cond_hidden_states.shape[1] == 1
+            and tuple(hidden_states.shape[1:]) == tuple(cond_hidden_states.shape[2:])
+            and hidden_states.shape[1] == self.config.in_channels
+            and cond_hidden_states.shape[2] == self.config.in_channels
+        )
 
-            hidden_states_list.append(hidden_states_per_sample)
+        if dense_single_radar:
+            dense_latent_h, dense_latent_w = hidden_states.shape[-2:]
+            image_tokens = self.pos_embed(hidden_states)
+            radar_tokens = self.pos_embed(cond_hidden_states[:, 0])
+            hidden_states = torch.cat([image_tokens, radar_tokens], dim=1)
+            attention_mask = None
+        else:
+            latent_sizes = [hs.shape[-2:] for hs in hidden_states]
+            hidden_states_list = []
+            for idx in range(bsz):
+                hidden_states_per_sample = self.pos_embed(hidden_states[idx][None])[0]
+                if cond_hidden_states is not None:
+                    for ref in cond_hidden_states[idx]:
+                        hidden_states_per_sample = torch.cat(
+                            [hidden_states_per_sample, self.pos_embed(ref[None])[0]])
 
-        max_len = max([len(hs) for hs in hidden_states_list])
-        attention_mask = torch.zeros(bsz, max_len, dtype=torch.bool, device=self.device)
-        for i, hs in enumerate(hidden_states_list):
-            attention_mask[i, :len(hs)] = True  # right padding
-        # import pdb; pdb.set_trace()
-        hidden_states = pad_sequence(hidden_states_list, batch_first=True, padding_value=0.0, padding_side='right')
+                hidden_states_list.append(hidden_states_per_sample)
+
+            max_len = max([len(hs) for hs in hidden_states_list])
+            attention_mask = torch.zeros(bsz, max_len, dtype=torch.bool, device=self.device)
+            for i, hs in enumerate(hidden_states_list):
+                attention_mask[i, :len(hs)] = True  # right padding
+            # import pdb; pdb.set_trace()
+            hidden_states = pad_sequence(hidden_states_list, batch_first=True, padding_value=0.0, padding_side='right')
 
         temb = self.time_text_embed(timestep, pooled_projections)
         encoder_hidden_states = self.context_embedder(encoder_hidden_states)
@@ -614,20 +638,36 @@ class SD3Transformer2DModel(
         hidden_states = self.proj_out(hidden_states)
 
         patch_size = self.config.patch_size
-        latent_sizes = [(latent_size[0] // patch_size, latent_size[1] // patch_size)
-                        for latent_size in latent_sizes]
 
-        # import pdb; pdb.set_trace()
-        # unpatchify
-        output = [rearrange(hs[:math.prod(latent_size)], '(h w) (p q c) -> c (h p) (w q)',
-                            h=latent_size[0], w=latent_size[1], p=patch_size, q=patch_size)
-                  for hs, latent_size in zip(hidden_states, latent_sizes)]
+        if dense_single_radar:
+            latent_h = dense_latent_h // patch_size
+            latent_w = dense_latent_w // patch_size
+            output = (
+                hidden_states[:, : latent_h * latent_w]
+                .reshape(
+                    hidden_states.shape[0], latent_h, latent_w,
+                    patch_size, patch_size, self.out_channels,
+                )
+                .permute(0, 5, 1, 3, 2, 4)
+                .reshape(
+                    hidden_states.shape[0], self.out_channels,
+                    latent_h * patch_size, latent_w * patch_size,
+                )
+            )
+        else:
+            latent_sizes = [(latent_size[0] // patch_size, latent_size[1] // patch_size)
+                            for latent_size in latent_sizes]
+            # import pdb; pdb.set_trace()
+            # unpatchify
+            output = [rearrange(hs[:math.prod(latent_size)], '(h w) (p q c) -> c (h p) (w q)',
+                                h=latent_size[0], w=latent_size[1], p=patch_size, q=patch_size)
+                      for hs, latent_size in zip(hidden_states, latent_sizes)]
 
-        try:
-            output = torch.stack(output)    # can be staked if all have the save shape
-        except:
-            # cannot be stacked
-            pass
+            try:
+                output = torch.stack(output)    # can be staked if all have the save shape
+            except:
+                # cannot be stacked
+                pass
 
         if USE_PEFT_BACKEND:
             # remove `lora_scale` from each PEFT layer

@@ -20,6 +20,33 @@ def sample_seed(seed: int, sample_id: str) -> int:
     return int.from_bytes(digest[:8], byteorder="little", signed=False) % (2**63 - 1)
 
 
+def sample_diagonal_gaussian(mean: torch.Tensor, std: torch.Tensor, generator: torch.Generator) -> torch.Tensor:
+    """Sample cached VAE posterior parameters without sharing RNG state."""
+    noise = torch.randn(mean.shape, generator=generator, device=mean.device, dtype=mean.dtype)
+    return mean + std * noise
+
+
+def pad_inference_batch(batch: dict, target_size: int) -> dict:
+    """Repeat the last target-free sample so a static compiled batch stays fixed-size."""
+    sample = batch["data"]["cam2image"]
+    current_size = len(sample["texts"])
+    if target_size < current_size:
+        raise ValueError(f"Cannot pad batch of {current_size} samples to smaller size {target_size}")
+    if target_size == current_size:
+        return batch
+    if current_size <= 0:
+        raise ValueError("Cannot pad an empty inference batch")
+
+    padding = target_size - current_size
+    sample["cam_values"].extend([sample["cam_values"][-1]] * padding)
+    sample["pose_values"] = torch.cat(
+        [sample["pose_values"], sample["pose_values"][-1:].expand(padding, -1)], dim=0
+    )
+    sample["texts"].extend([sample["texts"][-1]] * padding)
+    sample["metadata"].extend([dict(sample["metadata"][-1]) for _ in range(padding)])
+    return batch
+
+
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:

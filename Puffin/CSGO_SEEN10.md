@@ -57,6 +57,24 @@ python infer_seen10.py --mode both --seed 0 \
   --output-root "$OUTPUT_ROOT"
 ```
 
+以上原命令保持 eager、batch size 1 和既有 seed/signature 语义，因此可继续 resume 旧 manifest。Seen-10 加速按四个阶段执行：
+
+1. 批量阶段按 manifest 行顺序组成固定 block。某个 block 有缺图时会重算整个 block，但只写入缺少的 JPEG；compiled 模式会把诊断尾批补齐到固定 batch size，再丢弃补齐样本的输出。
+2. 缓存阶段每张 radar 只编码一次并缓存 VAE posterior 参数，SD3 pipeline 在模型实例内复用。每个 sample 分别创建 posterior 与 diffusion generator；两者都从原有 `sample_seed(seed, sample_id)` 起步，但分别维护状态、不会相互消耗随机数，以保留 legacy 采样语义。
+3. Dense 阶段为等长单 radar tensor 增加 transformer 向量化路径，变长或多 radar 条件继续走通用动态路径。
+4. Compile 阶段只编译固定形状 transformer，使用 `mode="reduce-overhead"`、`dynamic=False`、`fullgraph=True`；编译参数和首次 compiled `model.generate` 状态写入 manifest，JPEG 完整性仍由 `complete` 单独记录。
+
+任一加速模式都不能与旧 eager 输出混用。Compiled engine 只支持本 Seen-10 的固定 448×448、单 radar 输入；其他变长或多 radar 调用应使用 eager，其 Transformer 会自动保留动态路径。若 compiled 首次推理失败或不适合当前设备，改用 eager 并指定另一个输出根目录重跑。VAE 解码默认按单图分块以限制显存，也可设置 `--decoder-chunk-size`。
+
+```bash
+bash scripts/run_csgo_seen10.sh infer --seed 0 \
+  --checkpoint "$OUTPUT_ROOT/seed_0/checkpoints/best.pth" \
+  --inference-engine compiled --batch-size 16 --decoder-chunk-size 1 \
+  --output-root "${OUTPUT_ROOT}_compiled"
+```
+
+加速模式会把 engine、batch size、seed 策略、优化版本与 compile 设置写入 manifest 签名；不能与旧 eager 输出混用。请为加速运行选择独立 `--output-root`。单独启用 `--batch-size N` 可使用 eager 批量推理，不触发 `torch.compile`。
+
 或用 shell runner 执行各阶段：
 
 ```bash
