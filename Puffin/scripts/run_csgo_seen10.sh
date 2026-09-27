@@ -5,6 +5,15 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$PROJECT_ROOT"
 
+# Explicit profile selection has its own parser and output namespace. With no
+# --experiment all original legacy arguments and defaults below are preserved.
+for argument in "$@"; do
+  if [[ "$argument" == "--experiment" || "$argument" == --experiment=* ]]; then
+    ALIGNED_PYTHON="${PUFFIN_PYTHON:-$PROJECT_ROOT/.venv/bin/python}"
+    exec "$ALIGNED_PYTHON" "$PROJECT_ROOT/scripts/run_csgo_aligned.py" "$@"
+  fi
+done
+
 MODE="${1:-}"
 if [[ -z "$MODE" ]]; then
   echo "Usage: $0 {check|smoke|train|infer|eval|all} [--seed N] [--inference-engine eager|compiled] [--batch-size N] [options]" >&2

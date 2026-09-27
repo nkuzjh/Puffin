@@ -19,6 +19,8 @@ import torch
 from PIL import Image
 from torch.utils.data import Dataset
 
+from csgo_seen10.prompts import build_pose_prompt
+
 
 DEFAULT_DATA_ROOT = "/home/jiahao/task/UniLIP/data/csgo_benchmark_v2"
 DEFAULT_SHARED_EVAL_DIR = "/home/jiahao/task/csgo_benchmark_v2_eval_general"
@@ -62,8 +64,8 @@ class CsgoSeen10Dataset(Dataset):
     """Read one published Seen-10 split and adapt it to Puffin cam2image.
 
     ``include_target=False`` is the inference contract: the target image path
-    remains metadata only and is never opened. The normalized benchmark pose
-    remains an explicit numeric condition in both training and inference.
+    remains metadata only and is never opened. Legacy uses normalized numeric
+    pose; the explicit aligned text mode adds no numerical adapter input.
     """
 
     def __init__(
@@ -75,6 +77,9 @@ class CsgoSeen10Dataset(Dataset):
         maps: Sequence[str] | None = None,
         max_samples: int | None = None,
         shared_eval_dir: str | None = None,
+        radar_size: int | None = None,
+        target_size: int | None = None,
+        pose_mode: str = "numeric",
     ):
         if image_size != 448:
             raise ValueError(f"CSGO Benchmark v2 generation requires 448px, got {image_size}")
@@ -82,6 +87,13 @@ class CsgoSeen10Dataset(Dataset):
         self.split = split
         self.include_target = bool(include_target)
         self.image_size = int(image_size)
+        self.radar_size = int(radar_size if radar_size is not None else image_size)
+        self.target_size = int(target_size if target_size is not None else image_size)
+        if self.target_size != 448 or self.radar_size not in (224, 448):
+            raise ValueError("Seen-10 requires FPV448 and radar224 or legacy radar448")
+        if pose_mode not in ("numeric", "text"):
+            raise ValueError(f"Unsupported pose mode: {pose_mode}")
+        self.pose_mode = pose_mode
         self._radar_cache: OrderedDict[str, torch.Tensor] = OrderedDict()
 
         protocol = _load_protocol(shared_eval_dir)
@@ -101,7 +113,7 @@ class CsgoSeen10Dataset(Dataset):
         radar_path = row["radar_path"]
         radar = self._radar_cache.get(radar_path)
         if radar is None:
-            radar = _image_tensor(radar_path, self.image_size)
+            radar = _image_tensor(radar_path, self.radar_size)
             self._radar_cache[radar_path] = radar
             if len(self._radar_cache) > 10:
                 self._radar_cache.popitem(last=False)
@@ -109,8 +121,7 @@ class CsgoSeen10Dataset(Dataset):
             self._radar_cache.move_to_end(radar_path)
         item: dict[str, Any] = {
             "cam_values": radar,
-            "pose_values": torch.tensor(row["pose"], dtype=torch.float32),
-            "text": TASK_TEXT.format(map_name=row["map_name"]),
+            "text": build_pose_prompt(row) if self.pose_mode == "text" else TASK_TEXT.format(map_name=row["map_name"]),
             "metadata": {
                 "sample_id": row["sample_id"],
                 "map_name": row["map_name"],
@@ -120,8 +131,10 @@ class CsgoSeen10Dataset(Dataset):
                 "target_path": row["image_path"],
             },
         }
+        if self.pose_mode == "numeric":
+            item["pose_values"] = torch.tensor(row["pose"], dtype=torch.float32)
         if self.include_target:
-            item["pixel_values"] = _image_tensor(row["image_path"], self.image_size)
+            item["pixel_values"] = _image_tensor(row["image_path"], self.target_size)
         return item
 
 
@@ -133,15 +146,19 @@ def collate_seen10(samples: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     include_target = ["pixel_values" in sample for sample in samples]
     if any(include_target) and not all(include_target):
         raise ValueError("A batch cannot mix target-free and target-bearing samples")
+    include_pose = ["pose_values" in sample for sample in samples]
+    if any(include_pose) and not all(include_pose):
+        raise ValueError("A batch cannot mix numeric and text-only pose contracts")
 
     data: dict[str, Any] = {
         "cam2image": {
             "cam_values": [[sample["cam_values"]] for sample in samples],
-            "pose_values": torch.stack([sample["pose_values"] for sample in samples]),
             "texts": [sample["text"] for sample in samples],
             "metadata": [dict(sample["metadata"]) for sample in samples],
         }
     }
+    if all(include_pose):
+        data["cam2image"]["pose_values"] = torch.stack([sample["pose_values"] for sample in samples])
     if all(include_target):
         data["cam2image"]["pixel_values"] = [sample["pixel_values"] for sample in samples]
     return {"data": data, "data_samples": None}

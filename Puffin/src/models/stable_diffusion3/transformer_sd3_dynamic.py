@@ -568,7 +568,13 @@ class SD3Transformer2DModel(
             and cond_hidden_states.ndim == 5
             and cond_hidden_states.shape[0] == bsz
             and cond_hidden_states.shape[1] == 1
-            and tuple(hidden_states.shape[1:]) == tuple(cond_hidden_states.shape[2:])
+            and (
+                tuple(hidden_states.shape[1:]) == tuple(cond_hidden_states.shape[2:])
+                or (
+                    tuple(hidden_states.shape[-2:]) == (56, 56)
+                    and tuple(cond_hidden_states.shape[-2:]) == (28, 28)
+                )
+            )
             and hidden_states.shape[1] == self.config.in_channels
             and cond_hidden_states.shape[2] == self.config.in_channels
         )

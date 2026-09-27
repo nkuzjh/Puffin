@@ -32,6 +32,14 @@ repository:
   <img src="assets/puffin-world-demo.webp" alt="Puffin-World demo" width="100%">
 </p>
 
+## Local CSGO Benchmark v2 integration
+
+For the Puffin (not Puffin-World) generation-only baseline, see the
+[run and migration guide](Puffin/CSGO_SEEN10.md),
+[aligned experiment design](CSGO_SEEN10_PLAN.md), and
+[validation record](Puffin/CSGO_SEEN10_VALIDATION.md).
+The aligned profile is opt-in; legacy commands and results remain separate.
+
 ## 📝 Changelog & News
 
 - [x] 2026.09.04: The paper of **Puffin-World** is released on [arXiv](https://arxiv.org/abs/2609.04196).

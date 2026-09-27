@@ -772,7 +772,8 @@ class Qwen2p5RadioStableDiffusion3HFDynamic(BaseModel):
                  prompt_reasoning=None,
                  progress_bar=True,
                  radar_latents=None,
-                 decoder_chunk_size=None):
+                 decoder_chunk_size=None,
+                 radar_dense=True):
         assert len(prompt) == len(cfg_prompt)
         b = len(prompt)
         output_reasoning = [''] * b
@@ -845,7 +846,12 @@ class Qwen2p5RadioStableDiffusion3HFDynamic(BaseModel):
                     radar_latents = torch.stack(
                         [latent.to(device=self.device) for latent in radar_latents], dim=0
                     )
-                cond_latents = radar_latents[:, None]
+                # The list route is the native variable-size reference for
+                # aligned 224px radar / 448px target inference. The tensor
+                # route enables the separately verified dense fast path.
+                cond_latents = radar_latents[:, None] if radar_dense else [
+                    [latent] for latent in radar_latents
+                ]
             text_inputs = self.prepare_gen_prompts(prompt + cfg_prompt)
             if pixel_values_init is not None:
                 # for the generation with the camera map and initial view (cross-view generation)

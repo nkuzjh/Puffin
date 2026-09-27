@@ -39,12 +39,38 @@ def pad_inference_batch(batch: dict, target_size: int) -> dict:
 
     padding = target_size - current_size
     sample["cam_values"].extend([sample["cam_values"][-1]] * padding)
-    sample["pose_values"] = torch.cat(
-        [sample["pose_values"], sample["pose_values"][-1:].expand(padding, -1)], dim=0
-    )
+    if "pose_values" in sample:
+        sample["pose_values"] = torch.cat(
+            [sample["pose_values"], sample["pose_values"][-1:].expand(padding, -1)], dim=0
+        )
     sample["texts"].extend([sample["texts"][-1]] * padding)
     sample["metadata"].extend([dict(sample["metadata"][-1]) for _ in range(padding)])
     return batch
+
+
+def inspect_prediction_root(task_root: Path, signature: str, expected_relatives: set[str]) -> dict | None:
+    """Validate a resumable block before writing any aligned prediction."""
+    manifest_path = task_root / "inference_manifest.json"
+    existing = load_matching_manifest(manifest_path, signature)
+    if task_root.is_symlink():
+        raise ValueError(f"Refusing to follow a prediction root symlink: {task_root}")
+    if not task_root.exists():
+        return existing
+    for path in task_root.rglob("*"):
+        if path.is_symlink():
+            raise ValueError(f"Refusing to follow a prediction symlink: {path}")
+        if not path.is_file():
+            continue
+        relative = path.relative_to(task_root).as_posix()
+        if existing is None:
+            raise ValueError(f"Refusing nonempty prediction root without a matching manifest: {path}")
+        if relative == "inference_manifest.json":
+            continue
+        if not relative.startswith("gen_imgs/") or relative[len("gen_imgs/"):] not in expected_relatives:
+            raise ValueError(f"Unexpected file in prediction root: {path}")
+        if not is_valid_rgb_jpeg(path):
+            raise ValueError(f"Invalid existing prediction: {path}")
+    return existing
 
 
 def sha256_file(path: Path) -> str:

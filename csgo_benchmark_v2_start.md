@@ -1,3 +1,9 @@
+> 历史首次接入需求，仅作溯源，不是当前 aligned 实验的执行指令。
+> 当前设计见 [CSGO_SEEN10_PLAN.md](CSGO_SEEN10_PLAN.md)，迁移与运行命令见
+> [Puffin/CSGO_SEEN10.md](Puffin/CSGO_SEEN10.md)，实际验收见
+> [Puffin/CSGO_SEEN10_VALIDATION.md](Puffin/CSGO_SEEN10_VALIDATION.md)。
+> 下文的数值 pose、seed 0、旧训练预算等不覆盖已批准的 aligned 配方。
+
 你负责将当前已 clone 的独立模型项目接入 CSGO Benchmark v2 Seen-10。
 
 【项目参数】

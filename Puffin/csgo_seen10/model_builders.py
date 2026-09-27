@@ -23,10 +23,17 @@ class EmptyQwenFromConfig:
         model_name_or_path: str = "Qwen/Qwen2.5-1.5B-Instruct",
         dtype: str = "bfloat16",
         attn_implementation: str = "sdpa",
+        revision: str | None = None,
+        local_files_only: bool = False,
     ):
         from transformers import AutoConfig, AutoModelForCausalLM
 
-        config = AutoConfig.from_pretrained(model_name_or_path)
+        source_kwargs = {}
+        if revision is not None:
+            source_kwargs["revision"] = revision
+        if local_files_only:
+            source_kwargs["local_files_only"] = True
+        config = AutoConfig.from_pretrained(model_name_or_path, **source_kwargs)
         config._attn_implementation = attn_implementation
         model = AutoModelForCausalLM.from_config(
             config,
@@ -47,10 +54,17 @@ class EmptyRadioFromConfig:
         model_name_or_path: str = "nvidia/C-RADIOv3-H",
         dtype: str = "bfloat16",
         amp_dtype: str = "bfloat16",
+        revision: str | None = None,
+        local_files_only: bool = False,
     ):
         from src.models.radiov3.hf_model import RADIOConfig, RADIOModel
 
-        config = copy.deepcopy(RADIOConfig.from_pretrained(model_name_or_path))
+        source_kwargs = {}
+        if revision is not None:
+            source_kwargs["revision"] = revision
+        if local_files_only:
+            source_kwargs["local_files_only"] = True
+        config = copy.deepcopy(RADIOConfig.from_pretrained(model_name_or_path, **source_kwargs))
         config.args = dict(config.args or {})
         config.args.update(
             dtype=dtype,

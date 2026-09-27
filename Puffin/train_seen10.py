@@ -68,6 +68,16 @@ def _data_check(data_root: str, shared_eval_dir: str, limit: int) -> int:
 
 
 def main() -> int:
+    # Explicit aligned selection routes to the standalone optimizer-update
+    # runner. The native MMEngine path below remains the default.
+    experiment_parser = argparse.ArgumentParser(add_help=False)
+    experiment_parser.add_argument("--experiment")
+    selected, _ = experiment_parser.parse_known_args()
+    if selected.experiment == "csgo_seen10_exp32gen_aligned":
+        from csgo_seen10.aligned_train import main as aligned_main
+
+        return aligned_main(sys.argv[1:])
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--resume", type=str, default=None)
