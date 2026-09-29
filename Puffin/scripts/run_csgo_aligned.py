@@ -48,11 +48,25 @@ def parser():
     return result
 
 
-def launch(command, dry_run=False):
+def launch(command, dry_run=False, environment=None):
     import shlex
     print(shlex.join([str(item) for item in command]), flush=True)
     if not dry_run:
-        subprocess.run([str(item) for item in command], cwd=PROJECT_ROOT, check=True)
+        subprocess.run([str(item) for item in command], cwd=PROJECT_ROOT, check=True, env=environment)
+
+
+def evaluator_environment(interpreter):
+    """Never make the independent evaluator load Puffin's Conda shared libraries."""
+    environment = dict(os.environ)
+    for name in ("PYTHONPATH", "PYTHONHOME", "PYTHONUSERBASE"):
+        environment.pop(name, None)
+    prefix = Path(interpreter).absolute().parent.parent
+    environment["PYTHONNOUSERSITE"] = "1"
+    environment["PATH"] = str(prefix / "bin") + ":/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    environment["LD_LIBRARY_PATH"] = str(prefix / "lib")
+    if environment.get("PUFFIN_DRIVER_LIBRARY_PATH"):
+        environment["LD_LIBRARY_PATH"] += ":" + environment["PUFFIN_DRIVER_LIBRARY_PATH"]
+    return environment
 
 
 def training_command(args, smoke=False):
@@ -169,7 +183,7 @@ def evaluate(args, smoke=False):
         else:
             out = seed_root / "evaluation_shared" / args.selection / args.prediction_tag / task
             command += ["--output", str(out)]
-        launch(command, args.dry_run)
+        launch(command, args.dry_run, environment=evaluator_environment(interpreter))
 
 
 def check(args):

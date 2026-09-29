@@ -4,6 +4,24 @@
 本文只记录实际执行证据；操作命令见 [CSGO_SEEN10.md](CSGO_SEEN10.md)，
 设计和三方横向对照见 [CSGO_SEEN10_PLAN.md](../CSGO_SEEN10_PLAN.md)。
 
+## 2026-09-30：无 sudo 环境修复补充验收
+
+- 新环境统一由 Conda 创建在项目 `.venv`，包括 Python 3.10、`libgl`、`libglib`；
+  PyTorch 与训练依赖版本保持原配方，不改模型、数据或训练配置。
+- 默认不修改已有环境；显式 `--repair` 才安装依赖。拒绝 Conda base、危险路径、
+  非 Conda 原地修复和仍被进程使用的环境。权重和下载缓存保留。
+- 安装/运行入口隔离用户级包、外部 Python 路径和其他环境动态库；共享评测子进程
+  使用评测器自身的库路径，不继承 Puffin 的库路径。
+- 全部自动测试 **72/72** 通过，包含新建/修复的模拟安装流程、旧环境只读保留、
+  模块来源、原生库来源及评测器隔离。新 shell 与文档代码块语法检查通过。
+- 在独立临时目录 `/tmp/puffin-env-probe.vXBhUB/env` 实际创建了最小 Conda 环境，
+  安装 NumPy 2.2.5、opencv-python 5.0.0.93，OpenCV 导入与 `pip check` 通过；
+  `/proc/self/maps` 确认 `libGL.so.1`、GLib、GThread 均来自该前缀。
+- 复用本机已有 Puffin 环境完成只读导入检查与入口 dry-run，没有在该环境执行安装。
+  未进行远端实机验证、完整全新 PyTorch 环境安装或 GPU 训练/推理；没有启动正式实验。
+
+以下保留 2026-09-27 原验收记录。
+
 ## 环境、资产与隔离
 
 - 工作目录：`/home/jiahao/task/Puffin/Puffin`。

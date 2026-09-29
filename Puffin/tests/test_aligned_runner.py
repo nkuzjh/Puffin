@@ -17,6 +17,21 @@ spec.loader.exec_module(runner)
 
 
 class RunnerTests(unittest.TestCase):
+    def test_evaluator_does_not_inherit_model_environment(self):
+        with patch.dict(os.environ, {
+            "PYTHONPATH": "/model/foreign-packages",
+            "PYTHONHOME": "/model/python",
+            "LD_LIBRARY_PATH": "/model/.venv/lib",
+            "PATH": "/model/.venv/bin:/usr/bin",
+        }, clear=True):
+            environment = runner.evaluator_environment("/evaluator/.venv/bin/python")
+        self.assertNotIn("PYTHONPATH", environment)
+        self.assertNotIn("PYTHONHOME", environment)
+        self.assertEqual(environment["PYTHONNOUSERSITE"], "1")
+        self.assertEqual(environment["LD_LIBRARY_PATH"], "/evaluator/.venv/lib")
+        self.assertTrue(environment["PATH"].startswith("/evaluator/.venv/bin:"))
+        self.assertNotIn("/model/", environment["PATH"])
+
     def args(self, *more):
         args = runner.parser().parse_args(["train", "--experiment", runner.EXPERIMENT, *more])
         args.output_root = Path("/tmp/puffin-command-only")

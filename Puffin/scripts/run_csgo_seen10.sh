@@ -9,7 +9,11 @@ cd "$PROJECT_ROOT"
 # --experiment all original legacy arguments and defaults below are preserved.
 for argument in "$@"; do
   if [[ "$argument" == "--experiment" || "$argument" == --experiment=* ]]; then
-    ALIGNED_PYTHON="${PUFFIN_PYTHON:-$PROJECT_ROOT/.venv/bin/python}"
+    # Keep both setup and runtime isolated; a Conda prefix does not disable
+    # ~/.local packages or select its native libraries merely by naming Python.
+    source "$SCRIPT_DIR/puffin_environment.sh"
+    puffin_use_environment "${PUFFIN_PYTHON:-$PROJECT_ROOT/.venv/bin/python}"
+    ALIGNED_PYTHON="$PUFFIN_PYTHON"
     exec "$ALIGNED_PYTHON" "$PROJECT_ROOT/scripts/run_csgo_aligned.py" "$@"
   fi
 done

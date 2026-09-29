@@ -41,35 +41,54 @@ joint `exp32` 是次要对照。优化参数、架构和原生采样计算量是
 
 ## 新服务器：环境、官方资产与路径
 
-先把**包含本次新增/未提交文件**的代码复制到新服务器的独立空目录，仅clone上游官方仓库
-不会包含aligned接入。下面是需手动替换主机和目标路径的示例，不使用`--delete`：
+### 1. 获取包含 CSGO 接入的代码
+
+以下命令在 Bash 中执行，按仓库位于 `~/task/Puffin` 编写。
+**实际工作目录是内层 `~/task/Puffin/Puffin`。** 已 clone 则跳过这一步。
 
 ```bash
-# 在源服务器执行；目标/remote/workspace/Puffin应是新目录。
-rsync -av \
-  --exclude='.git/' --exclude='.venv/' --exclude='__pycache__/' \
-  --exclude='outputs/' --exclude='checkpoints/' --exclude='.cache/' \
-  --exclude='*.pth' --exclude='*.safetensors' --exclude='Puffin-World/' \
-  /home/jiahao/task/Puffin/ USER@NEW_SERVER:/remote/workspace/Puffin/
+# 仅在尚未 clone、且 ~/task/Puffin 不存在时执行。
+mkdir -p "$HOME/task" &&
+git clone https://github.com/nkuzjh/Puffin.git "$HOME/task/Puffin"
 ```
 
-发布数据与共享evaluator单独完整迁移，不重划split、不改校准；本机已有训练结果不随上述命令
-复制。需要迁移某个aligned run时，再单独复制完整`seed_42/`到新run root，保持相对链接，
-不要把旧legacy预测放入aligned目录。迁移命令仅提供给用户手动执行，本次未连接远程服务器。
+### 2. 准备环境
 
-从嵌套工作目录执行，例如 `cd /remote/workspace/Puffin/Puffin`。runner也会依据脚本位置
-定位工作目录，不依赖调用shell的cwd。不要复制旧服务器`.venv`。代码不包含大权重、
-数据、共享评测器和旧结果，须分别准备；无需安装UniLIP模型本体。
+服务器需有 Conda；无需 sudo，也无需退出 Conda `base`。脚本在项目 `.venv` 中创建
+独立 Conda 环境，安装 Python 依赖及 OpenCV 所需的 `libGL`、GLib 等运行库，
+不使用 base、其他项目或 `~/.local` 的 Python 包。此步骤不下载模型权重。
 
 ```bash
+cd "$HOME/task/Puffin/Puffin" &&
 bash scripts/setup_csgo_seen10.sh --env-only
-.venv/bin/python scripts/download_csgo_seen10_assets.py --profile aligned
-source <(.venv/bin/python scripts/download_csgo_seen10_assets.py --profile aligned --print-env)
 ```
 
-新环境采用Python3.10、Torch2.7.0/torchvision0.22.0 cu128及`requirements_seen10.txt`。
-已有兼容环境保留，不默认升级/降级。下载器只准备必要资产，按固定revision与SHA/blob校验，
-复用完整文件和HF缓存；损坏目标报错并保留，不静默覆盖。固定清单见
+如果已有 `.venv` Conda 环境安装失败（包括 `libGL.so.1` 缺失），改用以下修复命令。
+先将本次更新的代码同步到远端；请在该环境的下载/训练任务结束后执行。
+仅补齐项目环境，不删除环境、权重或下载缓存；环境被进程占用时会拒绝修复：
+
+```bash
+cd "$HOME/task/Puffin/Puffin" &&
+bash scripts/setup_csgo_seen10.sh --env-only --repair
+```
+
+新环境采用 Python 3.10、Torch 2.7.0 /
+torchvision 0.22.0 cu128 和 `requirements_seen10.txt`；不要复制旧服务器 `.venv`。
+已有兼容环境默认只检查并保留；修改已有环境须显式传 `--repair`。旧的普通 Python venv
+不原地改造成 Conda 环境，可通过 `PUFFIN_PYTHON` 指定新的项目内环境路径。
+脚本不安装系统软件或 GPU 驱动；主机仍需兼容的 Linux 基础运行库和 NVIDIA 驱动。
+
+### 3. 下载权重
+
+环境准备成功后执行，仅下载缺失的 aligned 权重和配套配置，复用已有完整资产。
+
+```bash
+cd "$HOME/task/Puffin/Puffin" &&
+bash scripts/download_csgo_seen10_assets.sh --profile aligned
+```
+
+下载脚本内部已包含完整性校验，无需重复检查。以上两步均不启动训练、推理或评测。
+固定资产清单见
 [`scripts/csgo_seen10_assets.json`](scripts/csgo_seen10_assets.json)。
 
 资产使用**官方Puffin Demo的实际配方**：KangLiao/Puffin的Base，wusize/Puffin的`vae.pth`，
@@ -80,35 +99,37 @@ source <(.venv/bin/python scripts/download_csgo_seen10_assets.py --profile align
 Base约8.90GB、VAE约335MB；Qwen/RADIO只下载小配置和tokenizer，骨干已在Base内。
 训练/推理从本地固定资产加载，不在运行中补下载。
 
-每次新开终端重新执行上面的`source <(... --print-env)`。路径不同的服务器显式设置：
+### 4. 训练/推理前加载资产路径
+
+下载成功后执行一次；每次新开 Bash 终端也执行此段，启用项目环境和资产路径。
+无需手写环境变量，不重复安装或下载。随后在同一终端执行训练/推理命令：
 
 ```bash
-export CSGO_DATA_ROOT="/remote/workspace/UniLIP/data/csgo_benchmark_v2"
-export SHARED_EVAL_DIR="/remote/workspace/csgo_benchmark_v2_eval_general"
-# 共享评测器由自己的仓库独立管理；已有环境无需重装。
-CSGO_EVAL_TORCH_BACKEND=cu128 bash "$SHARED_EVAL_DIR/setup_env.sh"
-export EVAL_PYTHON="$SHARED_EVAL_DIR/.venv/bin/python"
-
-export EXP="csgo_seen10_exp32gen_aligned"
-export ALIGNED_ROOT="$PWD/outputs/$EXP/Puffin"
+cd "$HOME/task/Puffin/Puffin" &&
+source scripts/activate_csgo_seen10.sh
 ```
 
-aligned数据/评测器路径优先级为CLI→环境变量→外层仓库同级默认目录。
-支持`--data-root`、`--shared-eval-dir`/`--eval-root`、`--eval-python`；兼容`DATA_ROOT`、
-`UNILIP_PYTHON`。显式错误路径不回退。训练Python默认项目`.venv/bin/python`，可设
-`PUFFIN_PYTHON`；评测Python使用显式配置或所选共享评测器的独立环境，绝不回退到训练环境。
-aligned不隐式继承可能指向旧结果的`OUTPUT_ROOT`，请显式传`--output-root`。
+### 5. 训练/评测前再准备数据与共享评测器
 
-可选诊断（不需要每次正式运行前重复执行）：
+发布数据与共享评测器须另行迁移。默认自动使用 `~/task/UniLIP/data/csgo_benchmark_v2`
+和 `~/task/csgo_benchmark_v2_eval_general`，不需要设置路径环境变量。
+共享评测器环境只需安装一次（已有环境则跳过）；请在尚未启用 Puffin 环境的新终端执行：
 
 ```bash
-bash scripts/setup_csgo_seen10.sh --check --profile aligned
-bash scripts/setup_csgo_seen10.sh --check-cuda --profile aligned
-.venv/bin/python scripts/download_csgo_seen10_assets.py --profile aligned --check --json
+CSGO_EVAL_TORCH_BACKEND=cu128 bash "$HOME/task/csgo_benchmark_v2_eval_general/setup_env.sh"
 ```
 
-`--check`不安装、不下载、不初始化CUDA；`--check-cuda`才执行小型GPU检查。
-跨服务器应重建环境并运行smoke，不能将本机验收描述为已在远端验证。
+后续命令使用下面两个 shell 简写变量，无需 export：
+
+```bash
+cd "$HOME/task/Puffin/Puffin" &&
+EXP="csgo_seen10_exp32gen_aligned" &&
+ALIGNED_ROOT="$PWD/outputs/$EXP/Puffin"
+```
+
+若数据/评测器不在默认位置，运行时传 `--data-root` / `--shared-eval-dir` 即可；
+评测默认使用共享评测器自己的 `.venv/bin/python`。迁移已有训练时完整保留 `seed_42/`
+及相对 checkpoint 链接，不混入旧实验预测，不重划数据 split 或修改 calibration。
 
 ## aligned检查、训练与精确恢复
 
@@ -169,7 +190,7 @@ done
 for selection in late best; do
   bash scripts/run_csgo_seen10.sh eval --experiment "$EXP" --seed 42 \
     --selection "$selection" --output-root "$ALIGNED_ROOT" --task both \
-    --prediction-tag native50_compiled_b16 --eval-python "$EVAL_PYTHON"
+    --prediction-tag native50_compiled_b16
 done
 ```
 
