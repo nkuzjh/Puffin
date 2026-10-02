@@ -4,6 +4,109 @@
 本文只记录实际执行证据；操作命令见 [CSGO_SEEN10.md](CSGO_SEEN10.md)，
 设计和三方横向对照见 [CSGO_SEEN10_PLAN.md](../CSGO_SEEN10_PLAN.md)。
 
+## 2026-10-02：首次正式启动的 NCCL 故障与通信修复
+
+- 首次 2 卡 × micro64 × accumulation1 正式训练于 08:17 启动，参数审计文件于
+  08:19:22 写入；08:26:39 双 rank 的 NCCL watchdog 报 CUDA illegal memory access。
+  首个日志没有 Python 模型异常栈，也没有任何 optimizer update loss 或 checkpoint。
+  失败产物和原日志已隔离到
+  `outputs/launch_control/failed_attempts/attempt_01_20261002_0835/`。
+- 独立双卡 NCCL 探针不加载 Puffin：默认配置下小 all-reduce 和对象广播通过，
+  256 MiB BF16 广播在两个 rank 均触发 CUDA 700。`NCCL_P2P_DISABLE=1`、
+  `NCCL_PROTO=Simple`、`NCCL_CUMEM_HOST_ENABLE=0` 的单变量对照均未修复。
+  仅设 `NCCL_SHM_DISABLE=1` 的对照通过相同广播，NCCL INFO 显示改走 NET/Socket。
+  两卡短 DDP 追加探针在此设置下还完成 3 次更新，两个 rank 的权重和一致。
+  探针脚本、日志保存在 `outputs/launch_control/`；这些是通信验收，尚不能代替完整 Puffin 训练验收。
+- 本机是两张 RTX PRO 6000 Blackwell Server Edition，Torch 2.7.0+cu128、
+  NCCL 2.26.2+cuda12.2，GPU 间拓扑为 NODE。NVIDIA 的
+  [NCCL issue #2418](https://github.com/NVIDIA/nccl/issues/2418)
+  报告了高度相似的双卡、版本与错误，并在其环境中由 NCCL 2.31.2 消除；
+  这提供外部佐证，不等于已证明本机的 NCCL 内部缺陷位置。
+- 当前服务器启动器在运行环境中传入 `NCCL_SHM_DISABLE=1`，正式训练进程继承该值；保持
+  seed42、2×64×1=128、19500 updates、2496000 次曝光、严格确定性及模型/数据配方不变。
+  通信改走 NET/Socket 后吞吐需重新实测，不声称跨通信实现逐位一致。
+
+### 08:52：修复后的正式双卡启动验收通过
+
+- 启动前完整 CPU 检查通过 87 项测试；08:43:55 从官方初始化重新启动正式训练，
+  仍使用原命令的 2×64×1 拓扑，仅新增上述 NCCL 环境设置。
+- 08:46:52 已完成 step2，08:48:38 达到 step6；08:50:35 主代理核查连续 step1–11，
+  最终保存验收证据时已推进至 step14。所有 loss 有限，step1=0.3246151358、
+  step10=0.3560837507、step14=0.3137413412；当前日志没有 traceback 或致命错误。
+- 父进程 PID 3103915、torchrun PID 3104023；rank0/1 PID 3104090/3104091，分别映射
+  GPU0/1，WORLD_SIZE=2，均继承正确数据根目录和 `NCCL_SHM_DISABLE=1`。
+  该阶段测得约 26.5 秒/update，仅为启动阶段吞吐，不含后续完整验证/保存时间。
+- 启动验收证据：`outputs/launch_control/startup_acceptance_20261002_0850.json`；
+  当前 stdout/stderr 仍为根目录 `puffin_aligned.nohup.out`，逐步 loss 为正式
+  `outputs/csgo_seen10_exp32gen_aligned/Puffin/seed_42/train_loss.jsonl`。
+- 已取消本对话尚未触发的启动检查，并结束完成职责的启动控制器；正式训练为独立 session，
+  确认训练父子进程继续存活。验收只覆盖成功启动，未完成 19500 步训练或全量推理/评测。
+
+## 2026-10-02：当前服务器启动预检与等待状态
+
+本次用户已授权在 UniLIP `exp32_1` 成功结束、Puffin 准备完成后启动正式训练；
+上方及历史记录的 `RUN_FORMAL=0` 是此前实施边界。本节记录的是启动准备，
+尚未取得本服务器正式双卡训练通过的证据。
+
+- `/home/jiahao/task/Puffin/Puffin` 与 `/data/jiahao/task/Puffin/Puffin` 指向同一目录。
+  项目环境的 CPU 导入、原生库隔离及 `pip check` 均通过；未初始化 CUDA。
+- 现有官方资产下载进程继续运行，没有重复下载。初始证据保存于
+  `outputs/launch_control/readiness_initial.json`，不能将下载中的资产视作完整性验证通过。
+- 03:31 初检时共享评测器目录缺失，缺 `protocol.py`、`run_eval.py`；发布数据缺
+  `calibration/z_calibration.json`。runner `check` 在评测器路径检查处失败。
+  本机 execution-minimal 归档 SHA256 与迁移清单一致，但不含 calibration，未修改数据合同。
+  待补 calibration 的发布 SHA256 为
+  `67436a888e0f79520bf1ab156009f7384b3a1ade7638b44513f31b2a9b6c14ee`。
+- `scripts/watch_csgo_aligned_start.py` 已作为独立后台进程运行，状态与事件记录分别为
+  `outputs/launch_control/state.json` 和 `events.jsonl`。启动要求前序训练进程退出、
+  根 TrainerState 达到 19550/19550 且含训练总结、最终权重完整，以及 Puffin CPU 预检通过。
+  排他锁、已有正式目录和启动事务记录防止重复启动。
+- 控制器保留用户的 `2 × micro64 × accumulation1 = 128`、seed42、19500 updates，
+  每次实际启动重新 source 激活脚本，stdout/stderr 固定写入
+  `puffin_aligned.nohup.out`；已有同名日志先归档。不会自动改变实验配方或盲目重试错误。
+- 7 项控制器模拟测试通过，覆盖未完成/异常退出、PID 复用、缺依赖拒绝启动、
+  不完整权重、已有输出、防重复及真实启动调用的环境/日志参数；另实测第二个控制器被锁拒绝。
+  这些是调度检查，不代表 GPU 训练验收。实际启动后须进程仍存活且至少完成 10 次有限 loss
+  更新才记录 `started_healthy`；启动失败记录 `failed_needs_repair`，需依据错误继续修复。
+
+### 04:08：依赖补齐后的完整 CPU 预检
+
+- 官方资产下载结束，独立校验进程于 03:40:59 完成，11/11 资产通过，退出码 0。
+  证据：`outputs/launch_control/assets_final_check.meta.json` 与 `.stdout.json`。
+- 用户已补齐共享评测器和 calibration，后者及 extrema 文件均匹配发布 SHA256。
+  原 calibration 外部软链接备份为 `calibration.external_symlink_backup_20261002_0402`，
+  项目数据目录中的 calibration 已放入相同内容的实际文件，外部源文件保持不变。
+- 共享协议也拒绝 images/radars 指向根目录外的软链接，故正式使用完整实际 bundle：
+  `CSGO_DATA_ROOT=/data/jiahao/data/csgo_benchmark_v2`。两根目录共 73 份发布清单、split、
+  calibration 文件哈希完全一致；控制器预检和正式启动共同使用该路径。
+- 环境检查通过；完整 aligned check 退出码 0、80 项测试通过；train/validation/discrete/
+  continuous 数量为 50000/5000/20000/12800，连续轨为 200 clips × 64 frames。
+  数据身份仍为 `7f6cb5b01c7103a0906e857cbb39eea59d1d70ab66150e8557f26093a0fea6c8`，
+  target isolation 检查通过。正式 2×64×1 命令 dry-run 通过；未运行 GPU 训练。
+- 控制器于 04:08 仅重启自身以加载数据路径配置；新 PID 为 2994288。
+  8 项控制器测试通过，包含预检与启动使用同一实际数据根目录、CPU 检查隐藏 CUDA。
+  当前仍等待 UniLIP exp32_1 成功结束，正式启动前会再次预检。
+- 完整 stdout/stderr、退出码、路径修复和数据比较证据保存于
+  `outputs/launch_control/preflight_20261002_0402.log` 和 `.json`。
+
+### 04:22：本对话定时检查与智能体修复
+
+用户已授权在原对话中定时检查，并在启动失败时由智能体根据项目文档修复后重试。
+`scripts/schedule_csgo_aligned_check.py` 用本机定时器调用已验证的 `codex queue --thread`
+向原线程 `01a0f8e6-b496-74a2-b507-d1981d9ba1e5` 投递，不创建独立桌面任务。
+
+- 首次时间为 2026-10-02 07:50:00 +08:00；worker PID 3001268，状态 `armed`。
+  当前服务器和 VS Code/Codex 会话需保持可用。
+- 实际同线程投递探针退出码 0，返回排队消息 ID；证据为
+  `outputs/launch_control/same_thread_queue_probe.json`。这验证消息入队，不代表未来检查已经执行。
+- 7 项定时器测试通过，覆盖到时只发一次、字面传递 prompt、未到时不发送、取消、
+  错误不盲重试、崩溃后的不确定投递及 thread 回执核对。
+- 检查指令保存于 `outputs/launch_control/puffin_scheduled_check_prompt.txt`，包含：
+  等待前序任务、查实际错误并修复、按文档保持有效 batch/更新预算/数据协议、归档失败产物、
+  防止重复训练、启动健康后停止检查。仍需等待时由智能体按实测 ETA 重设下一次检查。
+- 定时器本身不修改训练或启动模型，只投递检查任务；实际诊断修复由本对话智能体执行。
+  状态与投递记录为 `outputs/launch_control/puffin_scheduled_check.json`。
+
 ## 2026-09-30：无 sudo 环境修复补充验收
 
 - 新环境统一由 Conda 创建在项目 `.venv`，包括 Python 3.10、`libgl`、`libglib`；

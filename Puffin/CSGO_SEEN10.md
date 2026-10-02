@@ -131,6 +131,22 @@ ALIGNED_ROOT="$PWD/outputs/$EXP/Puffin"
 评测默认使用共享评测器自己的 `.venv/bin/python`。迁移已有训练时完整保留 `seed_42/`
 及相对 checkpoint 链接，不混入旧实验预测，不重划数据 split 或修改 calibration。
 
+当前服务器的完整发布数据实际位于 `/data/jiahao/data/csgo_benchmark_v2`。
+UniLIP 项目内的数据目录将 images/radars 软链接到该目录，不能作为共享协议的数据根目录：
+协议要求文件解析后的路径仍在数据根目录内部。手动执行以下 aligned 命令前，在同一终端设置：
+
+```bash
+export CSGO_DATA_ROOT=/data/jiahao/data/csgo_benchmark_v2
+export NCCL_SHM_DISABLE=1
+```
+
+2026-10-02 部署的后台启动器已包含这一设置。两路径的 73 份发布元数据、split 和
+calibration 文件哈希一致；该路径选择不改变数据划分、内容或实验配方。
+本机双卡 NCCL 2.26.2 的大张量通信实测触发 CUDA illegal memory access；
+`NCCL_SHM_DISABLE=1` 使独立双卡通信和短 DDP 探针通过，正式训练启动器也固定传入。
+这是本机通信传输配置，不改变有效 batch、随机种子、模型或确定性训练策略；
+绕过共享内存可能影响通信吞吐，正式 ETA 需依据修复后实际更新速度测量。
+
 ## aligned检查、训练与精确恢复
 
 ```bash
@@ -142,10 +158,10 @@ bash scripts/run_csgo_seen10.sh smoke --experiment "$EXP" --seed 42 \
   --inference-engine eager --batch-size 1 --num-workers 0 \
   --output-root "$PWD/outputs/smoke_$EXP/Puffin"
 
-# 正式示例：4卡×micro4×accum8=128。用户自行选择空闲设备。
-CUDA_VISIBLE_DEVICES=0,1,2,3 NPROC_PER_NODE=4 \
+# 正式示例：2卡×micro64×accum1=128。用户自行选择空闲设备。
+CUDA_VISIBLE_DEVICES=0,1 NPROC_PER_NODE=2 \
 bash scripts/run_csgo_seen10.sh train --experiment "$EXP" --seed 42 \
-  --micro-batch-size 4 --gradient-accumulation-steps 8 \
+  --micro-batch-size 64 --gradient-accumulation-steps 1 \
   --output-root "$ALIGNED_ROOT"
 
 # 相同run续跑，不从旧CSGO权重初始化。
@@ -227,8 +243,25 @@ PSNR/SSIM/LPIPS/TWE/TDE/FVD；equal-map macro、clip16/stride16、FVD224和track
 
 ## 实施与正式运行边界
 
-本次只实施和隔离smoke，`RUN_FORMAL=0`：不自动运行19,500步或全量32,800图。
-具体通过项和资源限制见验收文档；正式训练/推理/评测由用户手动执行。
+### 当前服务器的启动等待与对话检查
+
+2026-10-02 用户已授权正式启动与失败修复；下方 `RUN_FORMAL=0` 保留的是此前实施边界。
+本机 `scripts/watch_csgo_aligned_start.py` 等待 UniLIP 成功结束并通过 CPU 预检后启动，
+控制状态在 `outputs/launch_control/state.json`，当前训练日志固定为 `puffin_aligned.nohup.out`。
+`scripts/schedule_csgo_aligned_check.py` 将检查指令定时排入原 Codex 对话，供智能体诊断和修复。
+两者职责不同；定时消息处理需要原 VS Code/Codex 会话可用。
+
+```bash
+# 查看或取消尚未投递的对话检查；不会停止训练或启动等待器。
+/usr/bin/python3 scripts/schedule_csgo_aligned_check.py status
+/usr/bin/python3 scripts/schedule_csgo_aligned_check.py cancel
+```
+
+每次投递成功后该定时 worker 退出；后续智能体若需等待，会按实测 ETA 使用 `configure`
+重设时间，并在需要时后台启动其 `run` 子命令。完整部署与验收见 `CSGO_SEEN10_VALIDATION.md`。
+
+2026-09-27 的实施边界是隔离smoke、`RUN_FORMAL=0`；2026-10-02 用户已另行授权
+本机正式训练启动与失败修复。当前进展及尚未验收项以验收文档为准。
 预计五个完整checkpoint需约50–60GB，建议另预留资产、环境和输出后共80–100GB（不含数据）。
 训练/全量推理ETA必须依据目标服务器实测，不能套用ControlAR的9小时记录。
 
