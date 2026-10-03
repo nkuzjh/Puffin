@@ -3,15 +3,19 @@
 from __future__ import annotations
 
 import os
+import random
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
+import numpy as np
 import torch
 from torch import nn
 
 from csgo_seen10.aligned import DETERMINISM, aligned_semantics, apply_aligned_peft, config_fingerprint
 from csgo_seen10.aligned_samplers import AlignedTrainBatchSampler, AlignedValidationSampler
-from csgo_seen10.aligned_train import _configure_determinism, make_optimizer, make_scheduler
+from csgo_seen10.aligned_train import _configure_determinism, _restore_rng, _rng, _save, make_optimizer, make_scheduler
 
 
 class _Attention(nn.Module):
@@ -76,6 +80,30 @@ class _TinyPuffin(nn.Module):
 
 
 class AlignedTrainingTests(unittest.TestCase):
+    def test_single_rank_checkpoint_restores_rng_without_object_group(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(torch.cuda, "is_available", return_value=False):
+            random.seed(417)
+            np.random.seed(417)
+            torch.manual_seed(417)
+            model = nn.Linear(2, 1)
+            optimizer = torch.optim.AdamW(model.parameters())
+            scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1)
+            before = _rng()
+            expected = (random.random(), float(np.random.rand()), torch.rand(()).item())
+            _restore_rng(before)
+            arguments = dict(step=1, model=model, optimizer=optimizer, scheduler=scheduler,
+                             rank=0, world=1, seed=42, topology={"world_size": 1}, identities={},
+                             best=0.5, validation_loss=0.5, is_best=True, smoke_only=True,
+                             max_updates=2, resolved_configs={}, object_group=None)
+            path = _save(Path(directory), **arguments)
+            payload = torch.load(path, map_location="cpu", weights_only=False)
+            self.assertEqual(len(payload["rng_by_rank"]), 1)
+            self.assertEqual(payload["rng_by_rank"][0]["python"], before["python"])
+            _restore_rng(payload["rng_by_rank"][0])
+            self.assertEqual((random.random(), float(np.random.rand()), torch.rand(()).item()), expected)
+            with self.assertRaisesRegex(ValueError, "requires the Gloo object group"):
+                _save(Path(directory), **{**arguments, "world": 2})
+
     def test_deterministic_runtime_is_explicit_and_conflicts_fail(self):
         original_algorithms = torch.are_deterministic_algorithms_enabled()
         original_cudnn = torch.backends.cudnn.deterministic

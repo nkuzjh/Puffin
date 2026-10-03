@@ -226,11 +226,14 @@ def _validate(model, dataset, *, rank: int, world: int, micro_batch: int, worker
 
 def _save(checkpoint_dir: Path, *, step: int, model, optimizer, scheduler, rank: int, world: int,
           seed: int, topology: dict, identities: dict, best: float, validation_loss: float,
-          is_best: bool, smoke_only: bool, max_updates: int, resolved_configs: dict) -> Path:
+          is_best: bool, smoke_only: bool, max_updates: int, resolved_configs: dict,
+          object_group: dist.ProcessGroup | None) -> Path:
+    if world > 1 and object_group is None:
+        raise ValueError("Distributed checkpoint save requires the Gloo object group")
     states: list[Any] = [None] * world
     local_rng = _rng()
     if world > 1:
-        dist.all_gather_object(states, local_rng)
+        dist.all_gather_object(states, local_rng, group=object_group)
     else:
         states[0] = local_rng
     path = checkpoint_dir / f"step_{step:08d}.pth"
@@ -263,7 +266,7 @@ def _save(checkpoint_dir: Path, *, step: int, model, optimizer, scheduler, rank:
             save_error = f"Aligned checkpoint save failed at step {step}: {type(exc).__name__}: {exc}"
     if world > 1:
         result = [save_error]
-        dist.broadcast_object_list(result, src=0)
+        dist.broadcast_object_list(result, src=0, group=object_group)
         save_error = result[0]
     if save_error is not None:
         raise RuntimeError(save_error)
@@ -331,10 +334,31 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError("WORLD_SIZE * micro_batch_size * accumulation must equal 128")
     if args.num_workers < 0 or args.micro_batch_size <= 0 or args.gradient_accumulation_steps <= 0:
         raise ValueError("Microbatch, accumulation, and worker counts must be valid")
-    if world > 1 and not dist.is_initialized():
-        dist.init_process_group("nccl")
-    torch.cuda.set_device(local_rank)
-    device = torch.device("cuda", local_rank)
+    object_group = None
+    try:
+        if world > 1 and not dist.is_initialized():
+            dist.init_process_group("nccl")
+        torch.cuda.set_device(local_rank)
+        device = torch.device("cuda", local_rank)
+        if world > 1:
+            # Control-plane Python objects remain on CPU; DDP and numeric
+            # collectives continue using the default NCCL group.
+            object_group = dist.new_group(backend="gloo")
+        return _run(args, rank=rank, world=world, local_rank=local_rank,
+                    device=device, object_group=object_group)
+    finally:
+        try:
+            if object_group is not None:
+                dist.destroy_process_group(object_group)
+        finally:
+            if world > 1 and dist.is_initialized():
+                dist.destroy_process_group()
+
+
+def _run(args: argparse.Namespace, *, rank: int, world: int, local_rank: int,
+         device: torch.device, object_group: dist.ProcessGroup | None) -> int:
+    if world > 1 and object_group is None:
+        raise ValueError("Distributed aligned training requires the Gloo object group")
     _seed(args.seed + rank)
     max_updates = args.smoke_steps if args.smoke else 19_500
     if args.smoke and not 1 <= max_updates <= 10:
@@ -430,7 +454,7 @@ def main(argv: list[str] | None = None) -> int:
             setup_error = f"Aligned output preparation failed: {type(exc).__name__}: {exc}"
     if world > 1:
         result = [setup_error]
-        dist.broadcast_object_list(result, src=0)
+        dist.broadcast_object_list(result, src=0, group=object_group)
         setup_error = result[0]
     if setup_error is not None:
         raise RuntimeError(setup_error)
@@ -491,9 +515,8 @@ def main(argv: list[str] | None = None) -> int:
                   rank=rank, world=world, seed=args.seed, topology=topology,
                   identities=identities, best=best, validation_loss=validation_loss,
                   is_best=is_best, smoke_only=args.smoke,
-                  max_updates=max_updates, resolved_configs=resolved_configs)
-    if world > 1:
-        dist.destroy_process_group()
+                  max_updates=max_updates, resolved_configs=resolved_configs,
+                  object_group=object_group)
     return 0
 
 

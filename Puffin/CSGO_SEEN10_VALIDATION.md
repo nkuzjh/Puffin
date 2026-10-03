@@ -4,6 +4,79 @@
 本文只记录实际执行证据；操作命令见 [CSGO_SEEN10.md](CSGO_SEEN10.md)，
 设计和三方横向对照见 [CSGO_SEEN10_PLAN.md](../CSGO_SEEN10_PLAN.md)。
 
+## 2026-10-03 18:18：修复后再次启动正式双卡训练
+
+用户在修复测试验收后明确授权启动，覆盖此前“正式训练由用户手动启动”的限制。
+已按 `CSGO_SEEN10.md` 的 aligned 命令执行一次正式启动，并将 stdout/stderr 写入
+`/data/jiahao/task/Puffin/Puffin/puffin_aligned.nohup.out`。启动时间为 18:18:00 +08:00，
+父 PID 4183713、torchrun PID 4183804、rank0/1 PID 4183876/4183877。
+
+- 从官方 Base/VAE 初始化，不加载隔离 smoke 或不存在的原运行 checkpoint。
+  保持 GPU0/1、WORLD_SIZE=2、micro64、accum1、seed42、19500 updates、2496000 次曝光。
+- 数据根目录为 `/data/jiahao/data/csgo_benchmark_v2`，共享评测器为
+  `/data/jiahao/task/csgo_benchmark_v2_eval_general`；两个 rank 继承 `NCCL_SHM_DISABLE=1`。
+  修复源码 SHA256 与下方验收一致，未修改研究配方。
+- 原错误日志已确认备份后再使用同名当前日志；启动排他锁核查没有现存 Puffin 训练或
+  controller，正式目录为空。scheduler 仍禁用，未恢复后台启动器，其他用户 GPU 进程保留。
+- 启动记录：`outputs/launch_control/formal_attempt3_20261003_181800.json`。
+  18:26:14 主代理核查连续 step1–17 均为有限 loss，且较 18:24:21 的 step10 继续推进。
+  step1=0.32461513578891754、step10=0.3560837507247925、step17=0.32617099583148956。
+  父进程、torchrun 和两 rank 均存活，两个 rank 各占 30,842 MiB，实际映射为 rank0→GPU0、
+  rank1→GPU1；当前日志无 traceback、OOM 或 CUDA illegal memory access，启动验收通过。
+- 正式参数审计：trainable=88,823,808，unexpected=0，与批准方案相同。
+  验收证据：`outputs/launch_control/startup_acceptance_20261003_attempt3.json`；
+  controller 状态已更新为本次 `started_healthy`，旧启动验收仅作历史记录。
+  本次工作完成正式启动验收，尚未完成 19500 步、正式保存/验证里程碑或全量推理/评测。
+
+## 2026-10-03：4000 步 checkpoint 对象通信故障与修复验收
+
+本次边界为用户要求的修复与测试；正式训练由用户手动启动，未重新启动正式训练。
+以下路径相对项目根目录；时间均为 +08:00。
+
+- 第二次正式运行完成 4000 次有限 loss 更新：末步 loss=0.30334068834781647。
+  12:07:02 完成 5000 样本验证，loss=0.27598678988702596，随后双 rank 在
+  `_save` 的 `dist.all_gather_object(states, local_rng)` 触发 CUDA illegal memory access。
+  首个 checkpoint 尚未写出，不能从 4000 步恢复。错误发生于保存阶段。
+- 不加载模型的独立双卡探针，在保留 `NCCL_SHM_DISABLE=1`、使用
+  `CUDA_LAUNCH_BLOCKING=1` 且调用前同步 CUDA 后，以相同 RNG 对象负载复现 NCCL CUDA 700；
+  Gloo 对照在两卡各完成三轮对象汇总。证据：
+  `outputs/launch_control/failure_diagnosis_20261003_1724.json` 及其引用日志。
+  这些证据定位到本机 NCCL 对象通信路径，未进一步断言 NCCL 内部缺陷位置。
+- `csgo_seen10/aligned_train.py` 创建独立 CPU/Gloo 组，用于输出准备错误、RNG 汇总及保存结果
+  通知；DDP 梯度与验证数值归约仍使用默认 NCCL 组。正常与异常退出均清理通信组。
+  单卡直接保存本地 RNG；checkpoint 格式、严格恢复身份、训练预算和训练配方保持原约束。
+  修复后仍须传 `NCCL_SHM_DISABLE=1`。源码身份随修复改变，未绕过旧 checkpoint 的身份校验。
+- 完整 CPU 测试 89/89 通过。新增覆盖单卡 RNG 保存、真实双进程 Gloo 对象组路由、
+  分 rank RNG 恢复及已有 checkpoint 拒绝覆盖时的双 rank 错误通知。
+  AST 核查确认训练主体除对象组路由和通信组生命周期外相同。
+- 隔离双 GPU 探针在默认 NCCL 组完成 DDP 更新，再用 Gloo 完成实际 `_save` 与 RNG 恢复；
+  人为保存冲突通知两 rank 后，NCCL all-reduce 仍通过，探针退出码 0。
+- 真实 Puffin 模型使用原双卡 2×micro64×accum1、seed42 完成隔离 smoke 两步；
+  连续测试退出码 0，两次完整 checkpoint 均保存成功，每份 10,921,182,913 bytes。
+  两步 loss 为 0.32461513578891754、0.3012865334749222，与原正式运行前两步相同。
+  验证 loss 为 0.21681144833564758、0.2167654186487198。
+- 在另一个隔离目录从完整 step1 checkpoint 恢复，完成 step2 保存，日志无致命错误且进程已退出。
+  原 step1 文件用硬链接复用，未覆盖连续测试文件。完整 step2 payload 比较通过：
+  6,322 个张量、2 个 NumPy 数组、2,575 个标量叶子均相同，包含模型、optimizer、scheduler、
+  各 rank RNG 和身份元数据；训练/验证日志也相同。
+  用户中断对话后恢复测试的原 exec 会话句柄已不可读取，因此没有重新取得该进程退出码；
+  验收依据是完整终点产物、无错误日志、进程退出与逐项一致性比较。
+- 上述模型测试明确为 `smoke_only=true`：仅两次更新，使用 smoke 短 scheduler，
+  每次仅验证一个发布样本。它覆盖本次保存/恢复修复，不代表 19500 步正式训练、
+  5000 样本完整验证重跑或全量推理/评测验收，也不声称跨拓扑逐位一致。
+
+代码核查、测试日志、精确命令、完整隔离 checkpoint 和逐项比较报告位于
+`outputs/launch_control/checkpoint_gloo_fix_20261003/`，关键报告为
+`implementation_review.json`、`full_model_continuous.result.json`、`resume_comparison.json`。
+修复源码 SHA256：`a3b5d5c4c86aa1f8154e5a50f4d5019f84e23263980291293707f287b6dff414`。
+
+最终只读核查发现原正式输出目录已经不存在：本次 17:41 基线记录的三个运行文件
+在最终核查时缺失，不能声称已完整归档原运行；现存根日志的大小和 SHA256 仍匹配基线。
+现存失败日志及旧 controller 状态备份至
+`outputs/launch_control/failed_attempts/attempt_02_step4000_20261003_1815/`，根日志保留。
+后台 controller 和训练进程均未运行，scheduler `enabled=false`；`launch_claimed` 保留，
+控制状态更新为等待手动启动。手动正式启动命令见 `CSGO_SEEN10.md`。
+
 ## 2026-10-02：首次正式启动的 NCCL 故障与通信修复
 
 - 首次 2 卡 × micro64 × accumulation1 正式训练于 08:17 启动，参数审计文件于

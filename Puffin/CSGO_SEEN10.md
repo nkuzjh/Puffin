@@ -137,6 +137,7 @@ UniLIP 项目内的数据目录将 images/radars 软链接到该目录，不能�
 
 ```bash
 export CSGO_DATA_ROOT=/data/jiahao/data/csgo_benchmark_v2
+export SHARED_EVAL_DIR=/data/jiahao/task/csgo_benchmark_v2_eval_general
 export NCCL_SHM_DISABLE=1
 ```
 
@@ -192,6 +193,12 @@ step文件和日志；仅拷贝latest一个文件不足以保留历史best选择
 19500创建；`latest.pth`链接最近完整保存。主论文比较使用late，对齐UniLIP的final选择；
 best是补充，不能把不同模型原生loss直接横比。
 
+2026-10-03 修复了本机首次 checkpoint 保存时的 NCCL 对象收集故障。多卡训练内部创建
+独立 CPU/Gloo 组，用于输出准备错误通知、各 rank RNG 状态汇总和保存结果通知；
+DDP 梯度与验证数值归约继续使用 NCCL。单卡保存直接记录本地 RNG。
+此修复不新增运行参数，仍需保留本机 `NCCL_SHM_DISABLE=1` 的训练通信设置。
+源码内容身份会随修复改变；旧 checkpoint 的严格源码校验继续生效。
+
 ## aligned推理与共享评测
 
 ```bash
@@ -245,9 +252,40 @@ PSNR/SSIM/LPIPS/TWE/TDE/FVD；equal-map macro、clip16/stride16、FVD224和track
 
 ### 当前服务器的启动等待与对话检查
 
-2026-10-02 用户已授权正式启动与失败修复；下方 `RUN_FORMAL=0` 保留的是此前实施边界。
-本机 `scripts/watch_csgo_aligned_start.py` 等待 UniLIP 成功结束并通过 CPU 预检后启动，
-控制状态在 `outputs/launch_control/state.json`，当前训练日志固定为 `puffin_aligned.nohup.out`。
+2026-10-03 修复与隔离测试完成后，用户再次明确授权按下方 aligned 命令启动正式双卡训练。
+本次于 18:18:00 +08:00 启动，父进程 PID 4183713，拓扑仍为 2×64×1=128、seed42。
+后台启动器已结束，对话定时检查已取消；本次由智能体直接启动一次，并核查启动健康。
+18:26:14 +08:00 已核查连续 step1–17 均有限且持续推进，父进程和两个 rank 存活，
+启动验收通过。证据：`outputs/launch_control/startup_acceptance_20261003_attempt3.json`。
+
+本机 4000 步后的中止发生于首次 checkpoint 保存：默认 NCCL 组的
+`all_gather_object` 汇总 RNG 状态时触发 CUDA illegal memory access。
+已改用独立 CPU/Gloo 对象通信组，并通过 89 项 CPU 测试、混合 NCCL/Gloo 双卡探针、
+真实模型双卡两步保存及恢复一致性验收。详细证据见 `CSGO_SEEN10_VALIDATION.md`。
+原运行没有保存成功的 checkpoint，不能从 4000 步恢复；此次从官方初始化重新启动，
+正式输出仍为 `outputs/csgo_seen10_exp32gen_aligned/Puffin/seed_42/`。
+现存失败日志备份在 `outputs/launch_control/failed_attempts/attempt_02_step4000_20261003_1815/`，
+根目录 `puffin_aligned.nohup.out` 已切换为此次启动的 stdout/stderr。
+
+以下为本机修复后的正式启动命令，仍使用 2×64×1=128、seed42、19500 updates。
+执行前确认 GPU0/1 空闲，且输出目录没有其他新运行：
+
+```bash
+cd /data/jiahao/task/Puffin/Puffin
+source scripts/activate_csgo_seen10.sh
+export CSGO_DATA_ROOT=/data/jiahao/data/csgo_benchmark_v2
+export SHARED_EVAL_DIR=/data/jiahao/task/csgo_benchmark_v2_eval_general
+export NCCL_SHM_DISABLE=1
+EXP="csgo_seen10_exp32gen_aligned"
+ALIGNED_ROOT="$PWD/outputs/$EXP/Puffin"
+CUDA_VISIBLE_DEVICES=0,1 NPROC_PER_NODE=2 nohup bash scripts/run_csgo_seen10.sh train \
+  --experiment "$EXP" --seed 42 --micro-batch-size 64 --gradient-accumulation-steps 1 \
+  --output-root "$ALIGNED_ROOT" >puffin_aligned.nohup.out 2>&1 &
+```
+
+2026-10-02 的 `scripts/watch_csgo_aligned_start.py` 曾等待 UniLIP 成功结束并通过 CPU 预检后启动；
+下方 `RUN_FORMAL=0` 保留的是更早的实施边界。控制状态在
+`outputs/launch_control/state.json`，正式训练日志固定为 `puffin_aligned.nohup.out`。
 `scripts/schedule_csgo_aligned_check.py` 将检查指令定时排入原 Codex 对话，供智能体诊断和修复。
 两者职责不同；定时消息处理需要原 VS Code/Codex 会话可用。
 
